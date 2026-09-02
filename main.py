@@ -4,12 +4,15 @@ LogoBot - Telegram orqali fayllarga (PDF, ZIP, CBZ, rasm va boshqa hujjatlarga)
 logotip / muqova qo'yish va Telegram prevyusi (thumbnail) o'rnatish boti.
 
 - Barcha logika bitta faylda (main.py)
-- Qat'iy ketma-ketlik (FIFO Queue): Ko'p fayl bir vaqtda yuborilsa ham, o'z navbati bilan, xabar ID-si bo'yicha tartib bilan qaytariladi
+- PARALLEL QAYTA ISHLASH + TARTIBLI YUBORISH (Fast Parallel Processing & Ordered Delivery):
+  Barcha kelgan fayllar (10+) bir vaqtda darhol parallel yuklab olinib ishlanadi (maksimal tezlik),
+  lekin Telegram'ga yuborishda xabarlarning asl kelish tartibi (message_id) bo'yicha qat'iy navbat bilan,
+  har bir xabarga o'z javobi (reply) sifatida ketma-ket chiqariladi!
 - To'liq avtomatik Render.com Webhook (RENDER_EXTERNAL_URL orqali)
 - Barcha loglar to'liq o'chirilgan (Silent mode)
 - SQLite ma'lumotlar bazasi va Adminlar tizimi (Faqat adminlar uchun)
 - Doimiy logotiplar faqat fayl sifatida saqlanadi (saved_logos/ papkasida)
-- /done buyrug'i yuborilmaguncha cheksiz fayllarni qabul qilib navbat bilan ishlaydi
+- /done buyrug'i yuborilmaguncha cheksiz fayllarni qabul qiladi
 - Yuklab olingan va qayta ishlangan fayllar Telegram'ga yuborilishi bilan darhol o'chiriladi
 - Render.com-da 24/7 uxlab qolmaslik uchun har 5 daqiqada avtomatik Self-Ping
 """
@@ -88,9 +91,8 @@ DB_PATH = BASE_DIR / "logobot.db"
 SAVED_LOGOS_DIR = BASE_DIR / "saved_logos"
 SAVED_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Har bir chat uchun qat'iy navbat (FIFO Queue) tizimi
-chat_queues: Dict[int, asyncio.Queue] = {}
-chat_workers: Dict[int, asyncio.Task] = {}
+# Render 512MB RAM xavfsizligi va tezligi uchun bir vaqtning o'zida ko'pi bilan 4 ta fayl parallel ishlanadi
+PROCESSING_SEMAPHORE = asyncio.Semaphore(4)
 
 
 # =====================================================================
@@ -444,133 +446,152 @@ def process_image_file(input_path: str, output_path: str, cover_path: Optional[s
 
 
 # =====================================================================
-# NAVBAT (QUEUE) ORQALI QAT'IY KETMA-KET QAYTA ISHLASH
+# TEZKOR PARALLEL ISHLOV BERISH VA QAT'IY KETMA-KET YUBORISH (ORDERED DELIVERY)
 # =====================================================================
 
-async def process_and_send_file(
+class ChatOrderedDelivery:
+    """
+    Barcha parallel ishlangan fayllarni Telegram'ga qat'iy ravishda
+    kelgan xabarlar tartibi bo'yicha ketma-ket yuboruvchi navbat menejeri.
+    """
+    def __init__(self, chat_id: int, bot: Bot):
+        self.chat_id = chat_id
+        self.bot = bot
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.worker_task: Optional[asyncio.Task] = None
+
+    def ensure_started(self):
+        if self.worker_task is None or self.worker_task.done():
+            self.worker_task = asyncio.create_task(self._sender_loop())
+
+    async def _sender_loop(self):
+        while True:
+            item = await self.queue.get()
+            if item is None:
+                break
+
+            future, msg_id, orig_filename, status_msg = item
+            try:
+                # Ushbu aniq faylning parallel ishlov berilishi tugashini kutamiz
+                res = await future
+
+                if res and res.get("success"):
+                    output_file_path = res["output_path"]
+                    thumb_path = res["thumb_path"]
+                    has_thumb = res["has_thumb"]
+                    temp_dir = res["temp_dir"]
+
+                    doc_input = FSInputFile(output_file_path, filename=orig_filename)
+                    thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
+
+                    caption = f"✅ <b>Tayyor:</b> <code>{orig_filename}</code>"
+
+                    await self.bot.send_document(
+                        chat_id=self.chat_id,
+                        document=doc_input,
+                        thumbnail=thumb_input,
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_to_message_id=msg_id
+                    )
+
+                    log_processed_file(self.chat_id, orig_filename, Path(orig_filename).suffix.lower())
+
+                    # Telegram'ga ketishi bilan darhol o'chirish
+                    if temp_dir and os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+
+                    if status_msg:
+                        try:
+                            await self.bot.delete_message(chat_id=self.chat_id, message_id=status_msg.message_id)
+                        except Exception:
+                            pass
+
+                elif res and not res.get("success"):
+                    err = res.get("error", "Noma'lum xatolik")
+                    temp_dir = res.get("temp_dir")
+                    if temp_dir and os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+
+                    if status_msg:
+                        try:
+                            await self.bot.edit_message_text(
+                                chat_id=self.chat_id,
+                                message_id=status_msg.message_id,
+                                text=f"❌ <b>Xatolik ({orig_filename}):</b> <code>{err}</code>",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+
+            except Exception:
+                pass
+            finally:
+                self.queue.task_done()
+
+
+chat_deliveries: Dict[int, ChatOrderedDelivery] = {}
+
+def get_or_create_delivery(chat_id: int, bot: Bot) -> ChatOrderedDelivery:
+    if chat_id not in chat_deliveries:
+        chat_deliveries[chat_id] = ChatOrderedDelivery(chat_id, bot)
+    return chat_deliveries[chat_id]
+
+
+async def parallel_process_worker(
     bot: Bot,
     chat_id: int,
     file_id: str,
     orig_filename: str,
     active_logo: str,
-    original_message_id: int
+    original_message_id: int,
+    future: asyncio.Future
 ):
-    """
-    1 ta faylni xavfsiz /tmp/ papkaga yuklab oladi,
-    muqovasini almashtiradi, Telegramga xabar ID-si bilan javob qilib yuboradi va DARHOL o'chiradi.
-    """
+    """Faylni darhol parallel yuklab olib, muqovasini almashtiradi va natijani Future-ga yozadi."""
     job_id = f"job_{chat_id}_{original_message_id}_{uuid.uuid4().hex[:6]}"
     temp_dir = Path(f"/tmp/{job_id}")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    status_msg = None
-    try:
-        status_msg = await bot.send_message(
-            chat_id=chat_id,
-            text=f"⏳ <b>'{orig_filename}'</b> ishlanmoqda...",
-            parse_mode="HTML",
-            reply_to_message_id=original_message_id
-        )
-    except Exception:
-        pass
+    async with PROCESSING_SEMAPHORE:
+        try:
+            input_file_path = str(temp_dir / orig_filename)
+            tg_file = await bot.get_file(file_id)
+            await bot.download_file(tg_file.file_path, input_file_path)
 
-    try:
-        # 1. Faylni /tmp papkaga yuklab olish
-        input_file_path = str(temp_dir / orig_filename)
-        tg_file = await bot.get_file(file_id)
-        await bot.download_file(tg_file.file_path, input_file_path)
+            file_ext = Path(orig_filename).suffix.lower()
+            output_filename = f"edited_{orig_filename}"
+            output_file_path = str(temp_dir / output_filename)
+            thumb_path = str(temp_dir / "thumb.jpg")
 
-        file_ext = Path(orig_filename).suffix.lower()
-        output_filename = f"edited_{orig_filename}"
-        output_file_path = str(temp_dir / output_filename)
-        thumb_path = str(temp_dir / "thumb.jpg")
+            has_thumb = False
+            if active_logo and os.path.exists(active_logo):
+                make_telegram_thumbnail(active_logo, thumb_path)
+                has_thumb = True
 
-        # 2. Thumbnail tayyorlash
-        has_thumb = False
-        if active_logo and os.path.exists(active_logo):
-            make_telegram_thumbnail(active_logo, thumb_path)
-            has_thumb = True
+            if file_ext == ".pdf":
+                process_pdf_file(input_file_path, output_file_path, active_logo)
+            elif file_ext in (".zip", ".cbz"):
+                process_archive_file(input_file_path, output_file_path, active_logo)
+            elif file_ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                process_image_file(input_file_path, output_file_path, active_logo)
+            else:
+                shutil.copyfile(input_file_path, output_file_path)
 
-        # 3. Fayl turiga mos qayta ishlash
-        if file_ext == ".pdf":
-            process_pdf_file(input_file_path, output_file_path, active_logo)
-        elif file_ext in (".zip", ".cbz"):
-            process_archive_file(input_file_path, output_file_path, active_logo)
-        elif file_ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
-            process_image_file(input_file_path, output_file_path, active_logo)
-        else:
-            shutil.copyfile(input_file_path, output_file_path)
-
-        # 4. Telegram'ga darhol yuborish (aynan o'sha faylning message_id-siga javob qilib)
-        doc_input = FSInputFile(output_file_path, filename=orig_filename)
-        thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
-
-        caption = f"✅ <b>Tayyor:</b> <code>{orig_filename}</code>"
-
-        await bot.send_document(
-            chat_id=chat_id,
-            document=doc_input,
-            thumbnail=thumb_input,
-            caption=caption,
-            parse_mode="HTML",
-            reply_to_message_id=original_message_id
-        )
-
-        log_processed_file(chat_id, orig_filename, file_ext)
-
-        # Vaqtinchalik status xabarni o'chirish
-        if status_msg:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-            except Exception:
-                pass
-
-    except Exception as e:
-        if status_msg:
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_msg.message_id,
-                    text=f"❌ <b>Xatolik ({orig_filename}):</b> <code>{str(e)}</code>",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-    finally:
-        # 5. DARHOL O'CHIRISH: Xotira to'lib qolmasligi uchun barcha vaqtinchalik fayllarni o'chiramiz
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-async def get_or_create_chat_queue(chat_id: int, bot: Bot) -> asyncio.Queue:
-    """Har bir chat uchun qat'iy ketma-ketlikda (FIFO) ishlaydigan navbat boshqaruvchisi."""
-    if chat_id not in chat_queues or chat_queues[chat_id] is None:
-        queue: asyncio.Queue = asyncio.Queue()
-        chat_queues[chat_id] = queue
-
-        async def queue_worker():
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                try:
-                    f_id, f_name, logo, m_id = item
-                    await process_and_send_file(
-                        bot=bot,
-                        chat_id=chat_id,
-                        file_id=f_id,
-                        orig_filename=f_name,
-                        active_logo=logo,
-                        original_message_id=m_id
-                    )
-                except Exception:
-                    pass
-                finally:
-                    queue.task_done()
-
-        chat_workers[chat_id] = asyncio.create_task(queue_worker())
-
-    return chat_queues[chat_id]
+            if not future.done():
+                future.set_result({
+                    "success": True,
+                    "output_path": output_file_path,
+                    "thumb_path": thumb_path,
+                    "has_thumb": has_thumb,
+                    "temp_dir": str(temp_dir)
+                })
+        except Exception as e:
+            if not future.done():
+                future.set_result({
+                    "success": False,
+                    "error": str(e),
+                    "temp_dir": str(temp_dir)
+                })
 
 
 # =====================================================================
@@ -602,7 +623,7 @@ async def cmd_done_processing(message: Message, state: FSMContext):
     """Fayllar yuborish bosqichini tugatib, asosiy menyuga qaytaradi."""
     await state.clear()
     await message.answer(
-        "✅ <b>Fayllarni qabul qilish yakunlandi!</b>\nNavbatdagi barcha fayllar tartib bilan ishlanib, yetkaziladi.",
+        "✅ <b>Fayllarni qabul qilish yakunlandi!</b>\nBarcha fayllar navbat bilan o'z tartibida yetkaziladi.",
         parse_mode="HTML",
         reply_markup=main_menu_kb()
     )
@@ -645,8 +666,8 @@ async def cb_choice_saved_logo(callback: CallbackQuery, state: FSMContext):
     text = (
         "✅ <b>Saqlangan logotip tanlandi!</b>\n\n"
         "📤 <b>Endi fayllarni yuboring:</b>\n"
-        "<i>(Bir vaqtning o'zida 1 ta yoki 10+ ta PDF, ZIP, CBZ, rasm va boshqa fayllarni ketma-ket yuborishingiz mumkin)</i>\n\n"
-        "⚡ Bot barcha fayllarni kelgan tartibida (navbat bilan) aniq qabul qilib, o'z xabariga javob qilib qaytaradi.\n"
+        "<i>(Bir vaqtning o'zida 1 ta yoki 10+ ta PDF, ZIP, CBZ, rasm va boshqa fayllarni birdan tashlashingiz mumkin)</i>\n\n"
+        "⚡ Bot barcha fayllarni bir vaqtda parallel yuklab olib, o'z navbati bilan tartib bilan qaytarib beradi.\n"
         "Tugatgach pastdagi <b>«✅ Tugatish (/done)»</b> tugmasini bosing."
     )
     await callback.message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
@@ -691,8 +712,8 @@ async def handle_new_logo_uploaded(message: Message, state: FSMContext, bot: Bot
     text = (
         "✅ <b>Yangi logotip qabul qilindi va saqlandi!</b>\n\n"
         "📤 <b>Endi fayllarni yuboring:</b>\n"
-        "<i>(Bir vaqtning o'zida 1 ta yoki 10+ ta PDF, ZIP, CBZ, rasm va boshqa fayllarni ketma-ket yuborishingiz mumkin)</i>\n\n"
-        "⚡ Bot barcha fayllarni kelgan tartibida (navbat bilan) aniq qabul qilib, o'z xabariga javob qilib qaytaradi.\n"
+        "<i>(Bir vaqtning o'zida 1 ta yoki 10+ ta PDF, ZIP, CBZ, rasm va boshqa fayllarni birdan tashlashingiz mumkin)</i>\n\n"
+        "⚡ Bot barcha fayllarni bir vaqtda parallel yuklab olib, o'z navbati bilan tartib bilan qaytarib beradi.\n"
         "Tugatgach pastdagi <b>«✅ Tugatish (/done)»</b> tugmasini bosing."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
@@ -872,12 +893,12 @@ async def cb_cancel_action(callback: CallbackQuery, state: FSMContext):
 
 
 # =====================================================================
-# KELGAN HUJJATLAR VA RASMLARNI QAT'IY NAVBATGA (FIFO QUEUE) QO'YISH
+# BIR VAQTNING O'ZIDA KELGAN FAYLLARNI DARHOL PARALLEL ISHGA TUSHIRISH
 # =====================================================================
 
 @router.message(BotStates.waiting_for_files, F.document)
 async def handle_incoming_documents_in_queue(message: Message, state: FSMContext, bot: Bot):
-    """Kelgan har bir hujjatni qat'iy navbatga qo'yadi."""
+    """Kelgan har bir hujjatni darhol parallel ishlovga qo'yadi va yuborish navbatiga yozadi."""
     data = await state.get_data()
     active_logo = data.get("active_logo")
 
@@ -898,14 +919,37 @@ async def handle_incoming_documents_in_queue(message: Message, state: FSMContext
         await message.reply("⚠️ Fayl hajmi 50 MB dan katta. Telegram Bot API cheklovi tufayli kichikroq fayl yuboring.")
         return
 
-    # Chat navbatini olib, faylni navbatga qo'shamiz (FIFO)
-    queue = await get_or_create_chat_queue(message.chat.id, bot)
-    await queue.put((doc.file_id, filename, active_logo, message.message_id))
+    status_msg = None
+    try:
+        status_msg = await message.reply(f"⏳ <b>'{filename}'</b> qabul qilindi, ishlanmoqda...")
+    except Exception:
+        pass
+
+    # 1. Tartibli yetkazib berish (Ordered Delivery) navbatiga qo'shamiz
+    delivery = get_or_create_delivery(message.chat.id, bot)
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    await delivery.queue.put((future, message.message_id, filename, status_msg))
+    delivery.ensure_started()
+
+    # 2. Hech kutmasdan DARHOL parallel tarzda yuklab olish va qayta ishlashni boshlaymiz!
+    asyncio.create_task(
+        parallel_process_worker(
+            bot=bot,
+            chat_id=message.chat.id,
+            file_id=doc.file_id,
+            orig_filename=filename,
+            active_logo=active_logo,
+            original_message_id=message.message_id,
+            future=future
+        )
+    )
 
 
 @router.message(BotStates.waiting_for_files, F.photo)
 async def handle_incoming_photos_in_queue(message: Message, state: FSMContext, bot: Bot):
-    """Kelgan har bir rasmni qat'iy navbatga qo'yadi."""
+    """Kelgan har bir rasmni darhol parallel ishlovga qo'yadi va yuborish navbatiga yozadi."""
     data = await state.get_data()
     active_logo = data.get("active_logo")
 
@@ -921,9 +965,32 @@ async def handle_incoming_photos_in_queue(message: Message, state: FSMContext, b
     file_id = message.photo[-1].file_id
     filename = f"photo_{message.message_id}.jpg"
 
-    # Chat navbatini olib, faylni navbatga qo'shamiz (FIFO)
-    queue = await get_or_create_chat_queue(message.chat.id, bot)
-    await queue.put((file_id, filename, active_logo, message.message_id))
+    status_msg = None
+    try:
+        status_msg = await message.reply(f"⏳ <b>'{filename}'</b> qabul qilindi, ishlanmoqda...")
+    except Exception:
+        pass
+
+    # 1. Tartibli yetkazib berish navbatiga qo'shish
+    delivery = get_or_create_delivery(message.chat.id, bot)
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    await delivery.queue.put((future, message.message_id, filename, status_msg))
+    delivery.ensure_started()
+
+    # 2. DARHOL parallel tarzda ishga tushirish!
+    asyncio.create_task(
+        parallel_process_worker(
+            bot=bot,
+            chat_id=message.chat.id,
+            file_id=file_id,
+            orig_filename=filename,
+            active_logo=active_logo,
+            original_message_id=message.message_id,
+            future=future
+        )
+    )
 
 
 # =====================================================================
@@ -977,9 +1044,9 @@ async def on_startup(bot: Bot, base_url: Optional[str], dp: Dispatcher):
 
 
 async def on_shutdown(bot: Bot):
-    # Barcha navbatdagi vazifalarni to'xtatish
-    for t in chat_workers.values():
-        t.cancel()
+    for d in chat_deliveries.values():
+        if d.worker_task and not d.worker_task.done():
+            d.worker_task.cancel()
     await bot.session.close()
 
 
