@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 from PIL import Image
 from aiohttp import web
 
@@ -793,14 +793,22 @@ def main():
         print("BOT_TOKEN topilmadi!")
         return
 
-    # LOCAL BOT API ULANISH
-    if LOCAL_API_URL:
+    api_url = LOCAL_API_URL
+    # Agar Render-da ishlayotgan bo'lsa
+    if os.getenv("RENDER"):
+        if "localhost" in api_url or "127.0.0.1" in api_url:
+            api_url = api_url.replace("localhost", "157.173.110.5").replace("127.0.0.1", "157.173.110.5")
+        if not api_url:
+            api_url = "http://157.173.110.5:8081"
+
+    bot = None
+    if api_url:
         is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
         session = AiohttpSession(
-            api=TelegramAPIServer.from_base(LOCAL_API_URL, is_local=is_local)
+            api=TelegramAPIServer.from_base(api_url, is_local=is_local)
         )
         bot = Bot(token=BOT_TOKEN, session=session)
-        print(f"Local Bot API ishlatilmoqda: {LOCAL_API_URL} (is_local={is_local})")
+        print(f"Local Bot API ishlatilmoqda: {api_url} (is_local={is_local})")
     else:
         bot = Bot(token=BOT_TOKEN)
         print("Oddiy Telegram Bot API ishlatilmoqda (Max 50MB).")
@@ -809,9 +817,22 @@ def main():
     dp.include_router(router)
 
     async def run_polling():
-        await on_startup(bot, dp)
+        nonlocal bot
         try:
+            await on_startup(bot, dp)
             await dp.start_polling(bot)
+        except Exception as e:
+            if api_url:
+                print(f"Local Bot API ulanishda xatolik: {e}. Standart Telegram API-ga o'tilmoqda...")
+                try:
+                    await bot.session.close()
+                except Exception:
+                    pass
+                bot = Bot(token=BOT_TOKEN)
+                await on_startup(bot, dp)
+                await dp.start_polling(bot)
+            else:
+                raise e
         finally:
             await on_shutdown(bot)
 
