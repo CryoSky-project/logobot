@@ -441,7 +441,7 @@ def process_pdf_file(input_path: str, output_path: str, cover_path: Optional[str
         front_page = doc.new_page(0, width=pw, height=ph)
         front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
 
-    doc.save(output_path, garbage=3, deflate=True)
+    doc.save(output_path, garbage=1, deflate=True)
     doc.close()
     return output_path
 
@@ -463,7 +463,7 @@ def process_archive_file(input_path: str, output_path: str, cover_path: Optional
         first_img = image_files[0] if image_files else None
         last_img = image_files[-1] if len(image_files) > 1 else None
 
-        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as z_out:
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as z_out:
             for item in z_in.infolist():
                 if item.filename == first_img or item.filename == last_img:
                     z_out.writestr(item.filename, cover_bytes)
