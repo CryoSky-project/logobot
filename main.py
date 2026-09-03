@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 LogoBot - Telegram orqali fayllarga (PDF, ZIP, CBZ, rasm va boshqa hujjatlarga) logotip qo'yish.
-
 - Barcha fayllar QAT'IY KETMA-KETLIKDA BITTADAN (1-by-1) ishlanadi.
-- ServerDisconnectedError xatoliklarini aylanib o'tish uchun USERBOT (Telethon) orqali yuklash va yuborish mexanizmi qo'llaniladi.
+- /done olib tashlangan, fayllar cheksiz yuborilishi mumkin.
+- Local Bot API orqali katta fayllarni yuborish imkoniyati qo'shildi.
 """
 
 from __future__ import annotations
@@ -22,11 +22,7 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 from PIL import Image
-import aiohttp
 from aiohttp import web
-
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.enums import ParseMode
@@ -44,28 +40,16 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 
-# =====================================================================
-# BARCHA LOGLARNI TO'LIQ O'CHIRISH (SILENT MODE)
-# =====================================================================
-logging.disable(logging.CRITICAL)
-for logger_name in (
-    "aiogram", "aiohttp", "aiohttp.access", "aiohttp.server",
-    "aiohttp.web", "asyncio", "fitz", "PIL", "telethon"
-):
-    l = logging.getLogger(logger_name)
-    l.setLevel(logging.CRITICAL + 10)
-    l.propagate = False
-    l.handlers = [logging.NullHandler()]
-
+logging.basicConfig(level=logging.INFO)
 
 # =====================================================================
 # SOZLAMALAR VA PAPKALAR
 # =====================================================================
 BASE_DIR = Path(__file__).resolve().parent
 
-# .env yuklash
 env_path = BASE_DIR / ".env"
 if not env_path.exists():
     env_path = BASE_DIR.parent.parent / ".env"
@@ -74,29 +58,14 @@ if env_path.exists():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "8684264908:AAE9FzHZH6LKG6hri8XJdsOvXMwqYlK0I_o"
 PORT = int(os.getenv("PORT", "8000"))
-WEBHOOK_PATH = "/webhook"
+LOCAL_API_URL = os.getenv("LOCAL_API_URL", "") # e.g. "http://localhost:8081"
 DB_PATH = BASE_DIR / "logobot.db"
-
-API_ID = int(os.getenv("API_ID", "39181210"))
-API_HASH = os.getenv("API_HASH", "fb40947940c94722c5f0b7560df570fd")
-SESSION_STRING = (
-    os.getenv("SESSION_STRING")
-    or os.getenv("STRING_SESSION")
-    or "1ApWapzMBuwttkl3-A-RLgaoU1FpcJYDOvM59_0yuFKhNZ7G_523L7MHamFrxBPlVBGfY_-mfc4VC4niGEEsCsvZCn9nBtR-30CgZ42QkDaoKpVkit0UTUZBXzYvWYeM8KzNIDFIqJk2sDpKDoJ1X760M0Q1Lr_iUQilWCGQnhfrBKAgeBTCP9uYTXIa--GklDQSHWKBHHhP1oHHimzqt-S8qXgUjsyaqK6qSCJrhiM19t_wLetbM77szqA3VLj_8AQF5Y4hIyrW7kFqXXe7JMJrbP9-VBbMK9P8MqKa04twmQBjm5anUJ4dGtKumEqSianpPglrDDiqQvICqpO6SWIr181VpWyY="
-)
 
 SAVED_LOGOS_DIR = BASE_DIR / "saved_logos"
 SAVED_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Global variables for Userbot integration
-telethon_client: Optional[TelegramClient] = None
-UB_ID: Optional[int] = None
-BOT_USERNAME: Optional[str] = None
-
 # Qat'iy ketma-ket (1-by-1) ishlash uchun Global Navbat (Queue)
-task_queue = asyncio.Queue()
-upload_futures: Dict[str, asyncio.Future] = {}
-
+task_queue = None
 
 # =====================================================================
 # SQLITE MA'LUMOTLAR BAZASI
@@ -157,9 +126,6 @@ def init_db() -> None:
     conn.close()
 
 def is_admin(user_id: int) -> bool:
-    global UB_ID
-    if UB_ID and user_id == UB_ID:
-        return True
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
@@ -270,12 +236,6 @@ class AdminOnlyMiddleware(BaseMiddleware):
             return await handler(event, data)
         
         user_id = user.id
-        global UB_ID
-        
-        # Userbot bypass
-        if UB_ID and user_id == UB_ID:
-            return await handler(event, data)
-
         add_or_update_user(user_id, user.username, user.full_name)
 
         if not is_admin(user_id):
@@ -294,8 +254,6 @@ class AdminOnlyMiddleware(BaseMiddleware):
 router.message.middleware(AdminOnlyMiddleware())
 router.callback_query.middleware(AdminOnlyMiddleware())
 
-
-# --- FSM STATES ---
 class BotStates(StatesGroup):
     waiting_for_new_logo = State()
     waiting_for_permanent_logo = State()
@@ -316,8 +274,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 def files_receiving_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✅ Tugatish (/done)")],
-            [KeyboardButton(text="🔙 Asosiy menyu")]
+            [KeyboardButton(text="🔙 Bekor qilish (Asosiy menyuga qaytish)")]
         ],
         resize_keyboard=True
     )
@@ -355,30 +312,6 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 
 
 # =====================================================================
-# USERBOT UPLOAD INTERCEPTOR
-# =====================================================================
-@router.message()
-async def handle_userbot_messages(message: Message, state: FSMContext, bot: Bot):
-    """
-    Keltirilgan xabar Userbot'dan kelsa va DONE: bilan boshlansa, uni tutib olamiz.
-    (Bu router boshqa handlerlarga to'sqinlik qilmasligi uchun FSM yo'q paytda va aniq ID bilan ishlaydi,
-    lekin biz uni boshida tekshiramiz)
-    """
-    global UB_ID
-    if UB_ID and message.from_user.id == UB_ID:
-        if message.caption and message.caption.startswith("DONE:"):
-            job_id = message.caption.split(":")[1]
-            if job_id in upload_futures:
-                if not upload_futures[job_id].done():
-                    upload_futures[job_id].set_result(message.message_id)
-            return
-        return # Userbotning boshqa xabarlarini e'tiborsiz qoldiramiz
-
-    # Pass to other handlers if not Userbot uploading
-    pass
-
-
-# =====================================================================
 # QAT'IY 1-BY-1 KETMA-KETLIK YUKLASH TIZIMI (WORKER)
 # =====================================================================
 
@@ -391,8 +324,6 @@ async def edit_status(bot: Bot, chat_id: int, message_id: int, text: str):
 
 async def queue_worker_loop(bot: Bot):
     """Fayllarni bittadan (navbat bilan) yuklab oluvchi markaziy tsikl."""
-    global UB_ID, BOT_USERNAME
-
     while True:
         task = await task_queue.get()
         if task is None:
@@ -405,48 +336,20 @@ async def queue_worker_loop(bot: Bot):
         temp_dir.mkdir(parents=True, exist_ok=True)
         
         try:
-            # 1. Agar Userbot (Telethon) sozlangan bo'lsa -> Userbot orqali yuklaymiz
-            if telethon_client and telethon_client.is_connected() and UB_ID and BOT_USERNAME:
-                await edit_status(bot, user_chat_id, status_msg.message_id, "📥 <b>Navbat keldi:</b> Fayl Userbot orqali yuklab olinmoqda (Cheklovsiz)...")
-                
-                # Bot foydalanuvchining xabarini Userbotga nusxalaydi (Forward o'rniga Copy)
-                copied_to_ub = await bot.copy_message(
-                    chat_id=UB_ID,
-                    from_chat_id=user_chat_id,
-                    message_id=user_msg_id,
-                    caption=f"JOB:{job_id}"
-                )
-                
-                await asyncio.sleep(1.5) # Xabar yetib borishini kutish
-                
-                # Userbot ushbu xabarni o'qiydi
-                tg_msg = None
-                async for m in telethon_client.iter_messages(BOT_USERNAME, limit=10):
-                    if m.text and f"JOB:{job_id}" in m.text:
-                        tg_msg = m
-                        break
-                
-                if not tg_msg:
-                    raise Exception("Userbot xabarni qabul qila olmadi. Sinxronizatsiya xatosi.")
-                
-                input_path = str(temp_dir / file_name)
-                # Userbot orqali yuklash (100% ServerDisconnectedError'siz)
-                await telethon_client.download_media(tg_msg, file=input_path)
-                
-            else:
-                # Agar Userbot yo'q bo'lsa, standart Aiogram orqali yuklash
-                await edit_status(bot, user_chat_id, status_msg.message_id, "📥 <b>Navbat keldi:</b> Fayl yuklab olinmoqda...")
-                input_path = str(temp_dir / file_name)
-                tg_file = await bot.get_file(status_msg.reply_to_message.document.file_id if status_msg.reply_to_message.document else status_msg.reply_to_message.photo[-1].file_id)
-                await bot.download_file(tg_file.file_path, input_path)
-
+            # 1. Yuklab olish
+            await edit_status(bot, user_chat_id, status_msg.message_id, "📥 <b>Navbat keldi:</b> Fayl yuklab olinmoqda...")
             
+            # Asl fayl nomi bilan emas, input sifatida saqlaymiz (xatolik bo'lmasligi uchun)
+            input_path = str(temp_dir / f"input_{file_name}")
+            tg_file = await bot.get_file(status_msg.reply_to_message.document.file_id if status_msg.reply_to_message.document else status_msg.reply_to_message.photo[-1].file_id)
+            await bot.download_file(tg_file.file_path, input_path)
+
             # 2. Qayta ishlash (Logotip qo'yish)
             await edit_status(bot, user_chat_id, status_msg.message_id, "⚙️ Fayl qayta ishlanmoqda (Logotip qo'yilmoqda)...")
             
             file_ext = Path(file_name).suffix.lower()
-            output_filename = f"edited_{file_name}"
-            output_path = str(temp_dir / output_filename)
+            # Fayl aniq o'zining nomi bilan chiqishi kerak
+            output_path = str(temp_dir / file_name)
             thumb_path = str(temp_dir / "thumb.jpg")
             has_thumb = False
             
@@ -464,61 +367,19 @@ async def queue_worker_loop(bot: Bot):
                 shutil.copyfile(input_path, output_path)
                 
             # 3. Tayyor faylni yuborish
-            if telethon_client and telethon_client.is_connected() and UB_ID and BOT_USERNAME:
-                await edit_status(bot, user_chat_id, status_msg.message_id, "📤 <b>Yuklanmoqda:</b> Userbot serverga qaytarmoqda...")
-                
-                loop = asyncio.get_running_loop()
-                future = loop.create_future()
-                upload_futures[job_id] = future
-                
-                thumb_to_send = thumb_path if has_thumb and os.path.exists(thumb_path) else None
-                
-                # Userbot botga yuboradi
-                await telethon_client.send_file(
-                    BOT_USERNAME,
-                    file=output_path,
-                    caption=f"DONE:{job_id}",
-                    thumb=thumb_to_send,
-                    force_document=True
-                )
-                
-                # Aiogram uni qabul qilguncha kutamiz
-                try:
-                    uploaded_msg_id = await asyncio.wait_for(future, timeout=3600)
-                except asyncio.TimeoutError:
-                    raise Exception("Userbot faylni yuklashda Taym-autga uchradi.")
-                
-                # Aiogram qabul qilgan faylni foydalanuvchiga Forward (Copy) qiladi
-                await edit_status(bot, user_chat_id, status_msg.message_id, "✅ Tayyor, yuborilmoqda...")
-                await bot.copy_message(
-                    chat_id=user_chat_id,
-                    from_chat_id=UB_ID,
-                    message_id=uploaded_msg_id,
-                    reply_to_message_id=user_msg_id,
-                    caption=f"✅ <b>Tayyor:</b> <code>{file_name}</code>",
-                    parse_mode="HTML"
-                )
-                
-                # Userbot va Bot o'rtasidagi chatni tozalash
-                try:
-                    await bot.delete_message(UB_ID, copied_to_ub.message_id)
-                    await bot.delete_message(UB_ID, uploaded_msg_id)
-                except Exception:
-                    pass
-                
-            else:
-                # Standart Bot yuborishi
-                await edit_status(bot, user_chat_id, status_msg.message_id, "📤 Yuklanmoqda...")
-                doc_input = FSInputFile(output_path, filename=file_name)
-                thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
-                await bot.send_document(
-                    chat_id=user_chat_id,
-                    document=doc_input,
-                    thumbnail=thumb_input,
-                    caption=f"✅ <b>Tayyor:</b> <code>{file_name}</code>",
-                    parse_mode="HTML",
-                    reply_to_message_id=user_msg_id
-                )
+            await edit_status(bot, user_chat_id, status_msg.message_id, "📤 Yuklanmoqda...")
+            
+            doc_input = FSInputFile(output_path, filename=file_name)
+            thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
+            
+            await bot.send_document(
+                chat_id=user_chat_id,
+                document=doc_input,
+                thumbnail=thumb_input,
+                caption=f"✅ <b>Tayyor:</b> <code>{file_name}</code>",
+                parse_mode="HTML",
+                reply_to_message_id=user_msg_id
+            )
 
             log_processed_file(user_chat_id, file_name, file_ext)
 
@@ -533,8 +394,6 @@ async def queue_worker_loop(bot: Bot):
         finally:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
-            if job_id in upload_futures:
-                del upload_futures[job_id]
             task_queue.task_done()
             await asyncio.sleep(1) # Bitta fayl tugagach, keyingisiga o'tishdan oldin qisqa tanaffus
 
@@ -625,18 +484,15 @@ def process_image_file(input_path: str, output_path: str, cover_path: Optional[s
 # ASOSIY MENYU VA START HANDLERS
 # =====================================================================
 @router.message(CommandStart())
-@router.message(F.text == "🔙 Asosiy menyu")
+@router.message(F.text.in_(["🔙 Asosiy menyu", "🔙 Bekor qilish (Asosiy menyuga qaytish)"]))
 async def cmd_start(message: Message, state: FSMContext):
-    # Agar Userbot yozayotgan bo'lsa
-    global UB_ID
-    if UB_ID and message.from_user.id == UB_ID:
-        return
 
     await state.clear()
     user = message.from_user
     saved_logo = get_user_saved_logo(user.id)
     logo_status = "✅ O'rnatilgan" if saved_logo else "❌ O'rnatilmagan"
-    limit_status = "🚀 2000 MB (Userbot rejimi)" if telethon_client else "📦 50 MB"
+    
+    limit_status = "🚀 2000 MB (Local Bot API)" if LOCAL_API_URL else "📦 50 MB"
 
     text = (
         f"👋 <b>Assalomu alaykum, {user.first_name}!</b>\n\n"
@@ -648,17 +504,6 @@ async def cmd_start(message: Message, state: FSMContext):
         f"👇 <i>Fayllarga logotip qo'yish uchun quyidagi tugmani bosing:</i>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb())
-
-
-@router.message(Command("done"))
-@router.message(F.text == "✅ Tugatish (/done)")
-async def cmd_done_processing(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "✅ <b>Fayllarni qabul qilish yakunlandi!</b>\nNavbatdagi fayllar 1ma-1 qat'iy tartibda ishlanmoqda.",
-        parse_mode="HTML",
-        reply_markup=main_menu_kb()
-    )
 
 
 # =====================================================================
@@ -694,8 +539,8 @@ async def cb_choice_saved_logo(callback: CallbackQuery, state: FSMContext):
     text = (
         "✅ <b>Saqlangan logotip tanlandi!</b>\n\n"
         "📤 <b>Endi fayllarni yuboring:</b>\n"
-        "<i>(Bir nechta fayl yuborsangiz, bot ularni navbatga qo'yib, BITTADAN, shoshmasdan qayta ishlaydi. Bu orqali xatoliklar umuman bo'lmaydi!)</i>\n\n"
-        "Tugatgach pastdagi <b>«✅ Tugatish (/done)»</b> tugmasini bosing."
+        "<i>(Fayllarni cheksiz miqdorda yuboraverishingiz mumkin. Bot ularni navbatma-navbat ishlashda davom etadi.)</i>\n\n"
+        "Tugatish uchun pastdagi <b>«🔙 Bekor qilish»</b> tugmasini bosing."
     )
     await callback.message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
     await callback.answer()
@@ -731,8 +576,8 @@ async def handle_new_logo_uploaded(message: Message, state: FSMContext, bot: Bot
     text = (
         "✅ <b>Yangi logotip qabul qilindi va saqlandi!</b>\n\n"
         "📤 <b>Endi fayllarni yuboring:</b>\n"
-        "<i>(Bir nechta fayl yuborsangiz, bot ularni navbatga qo'yib, BITTADAN, shoshmasdan qayta ishlaydi. Bu orqali xatoliklar umuman bo'lmaydi!)</i>\n\n"
-        "Tugatgach pastdagi <b>«✅ Tugatish (/done)»</b> tugmasini bosing."
+        "<i>(Fayllarni cheksiz miqdorda yuboraverishingiz mumkin. Bot ularni navbatma-navbat ishlashda davom etadi.)</i>\n\n"
+        "Tugatish uchun pastdagi <b>«🔙 Bekor qilish»</b> tugmasini bosing."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
 
@@ -857,10 +702,6 @@ async def cb_cancel_action(callback: CallbackQuery, state: FSMContext):
 # =====================================================================
 @router.message(BotStates.waiting_for_files, F.document)
 async def handle_incoming_documents_in_queue(message: Message, state: FSMContext, bot: Bot):
-    # Ignore if Userbot
-    global UB_ID
-    if UB_ID and message.from_user.id == UB_ID:
-        return
 
     data = await state.get_data()
     active_logo = data.get("active_logo")
@@ -887,10 +728,6 @@ async def handle_incoming_documents_in_queue(message: Message, state: FSMContext
 
 @router.message(BotStates.waiting_for_files, F.photo)
 async def handle_incoming_photos_in_queue(message: Message, state: FSMContext, bot: Bot):
-    # Ignore if Userbot
-    global UB_ID
-    if UB_ID and message.from_user.id == UB_ID:
-        return
 
     data = await state.get_data()
     active_logo = data.get("active_logo")
@@ -915,110 +752,70 @@ async def handle_incoming_photos_in_queue(message: Message, state: FSMContext, b
 
 
 # =====================================================================
-# RENDER.COM HEALTH CHECK HTTP SERVER VA AUTO SELF-PING
+# RENDER HEALTH CHECK SERVER
 # =====================================================================
-async def health_check(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "LogoBot", "alive": True})
-
-async def auto_self_ping(base_url: str):
-    await asyncio.sleep(20)
-    target_url = f"{base_url.rstrip('/')}/health"
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(target_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    pass
-        except Exception:
-            pass
-        await asyncio.sleep(300)
+async def run_health_server():
+    try:
+        app = web.Application()
+        async def health(request):
+            return web.Response(text="Bot is running!")
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        print(f"Health check server listening on port {PORT}")
+    except Exception as e:
+        print(f"Health server error: {e}")
 
 
 # =====================================================================
-# WEBHOOK STARTUP VA SHUTDOWN
+# POLLING STARTUP VA SHUTDOWN
 # =====================================================================
-async def on_startup(bot: Bot, base_url: Optional[str], dp: Dispatcher):
-    global telethon_client, UB_ID, BOT_USERNAME
+async def on_startup(bot: Bot, dp: Dispatcher):
+    global task_queue
+    if task_queue is None:
+        task_queue = asyncio.Queue()
     init_db()
 
-    # Aiogram Bot haqida ma'lumot
-    try:
-        me = await bot.get_me()
-        BOT_USERNAME = me.username
-    except Exception:
-        pass
-
-    # Telethon User Client (2 GB fayllarni yuklash/yuborish uchun)
-    if SESSION_STRING and API_ID and API_HASH:
-        try:
-            telethon_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-            await telethon_client.start()
-            
-            # Userbot ma'lumoti
-            ub_me = await telethon_client.get_me()
-            UB_ID = ub_me.id
-
-            # PM ochiq bo'lishini ta'minlash uchun botga start bosib qo'yamiz
-            if BOT_USERNAME:
-                await telethon_client.send_message(BOT_USERNAME, "/start")
-                
-        except Exception as e:
-            print(f"Telethon error: {e}")
-            telethon_client = None
-
-    # Queue Worker ni ishga tushirish
+    asyncio.create_task(run_health_server())
     asyncio.create_task(queue_worker_loop(bot))
-
-    if base_url:
-        webhook_url = f"{base_url.rstrip('/')}{WEBHOOK_PATH}"
-        await bot.set_webhook(
-            url=webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=dp.resolve_used_update_types()
-        )
-        asyncio.create_task(auto_self_ping(base_url))
-    else:
-        await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=True)
 
 
 async def on_shutdown(bot: Bot):
-    global telethon_client
-    if telethon_client and telethon_client.is_connected():
-        await telethon_client.disconnect()
     await bot.session.close()
 
 
-# =====================================================================
-# MAIN
-# =====================================================================
 def main():
     if not BOT_TOKEN:
+        print("BOT_TOKEN topilmadi!")
         return
 
-    bot = Bot(token=BOT_TOKEN)
+    # LOCAL BOT API ULANISH
+    if LOCAL_API_URL:
+        is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
+        session = AiohttpSession(
+            api=TelegramAPIServer.from_base(LOCAL_API_URL, is_local=is_local)
+        )
+        bot = Bot(token=BOT_TOKEN, session=session)
+        print(f"Local Bot API ishlatilmoqda: {LOCAL_API_URL} (is_local={is_local})")
+    else:
+        bot = Bot(token=BOT_TOKEN)
+        print("Oddiy Telegram Bot API ishlatilmoqda (Max 50MB).")
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    base_url = (
-        os.getenv("RENDER_EXTERNAL_URL")
-        or os.getenv("APP_URL")
-        or os.getenv("SELF_PING_URL")
-    )
-    if not base_url and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
-        base_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+    async def run_polling():
+        await on_startup(bot, dp)
+        try:
+            await dp.start_polling(bot)
+        finally:
+            await on_shutdown(bot)
 
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-
-    webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-
-    setup_application(app, dp, bot=bot)
-
-    app.on_startup.append(lambda a: on_startup(bot, base_url, dp))
-    app.on_shutdown.append(lambda a: on_shutdown(bot))
-
-    web.run_app(app, host="0.0.0.0", port=PORT, access_log=None, print=lambda *args: None)
+    asyncio.run(run_polling())
 
 
 if __name__ == "__main__":
