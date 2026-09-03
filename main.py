@@ -43,7 +43,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 # =====================================================================
 # SOZLAMALAR VA PAPKALAR
@@ -902,12 +902,14 @@ def main():
     if api_url:
         is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
         session = AiohttpSession(
-            api=TelegramAPIServer.from_base(api_url, is_local=is_local)
+            api=TelegramAPIServer.from_base(api_url, is_local=is_local),
+            timeout=3600
         )
         bot = Bot(token=BOT_TOKEN, session=session)
         print(f"Local Bot API ishlatilmoqda: {api_url} (is_local={is_local})")
     else:
-        bot = Bot(token=BOT_TOKEN)
+        session = AiohttpSession(timeout=3600)
+        bot = Bot(token=BOT_TOKEN, session=session)
         print("Oddiy Telegram Bot API ishlatilmoqda (Max 50MB).")
 
     dp = Dispatcher(storage=MemoryStorage())
@@ -925,7 +927,8 @@ def main():
                     await bot.session.close()
                 except Exception:
                     pass
-                bot = Bot(token=BOT_TOKEN)
+                session = AiohttpSession(timeout=3600)
+                bot = Bot(token=BOT_TOKEN, session=session)
                 await on_startup(bot, dp)
                 await dp.start_polling(bot)
             else:
