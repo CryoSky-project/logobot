@@ -433,7 +433,7 @@ async def edit_status(bot: Bot, chat_id: int, message_id: int, text: str):
         pass
 
 
-ALBUMS_CACHE: Dict[str, List[Message]] = {}
+USER_BATCHES: Dict[int, Dict[str, Any]] = {}
 
 def extract_file_data(message: Message):
     if message.document:
@@ -447,32 +447,50 @@ def extract_file_data(message: Message):
         return ("photo", filename, file_id, ".jpg", message.message_id)
     return None
 
-async def process_album_after_delay(media_group_id: str, chat_id: int, active_logo: str, bot: Bot, status_msg: Message):
-    await asyncio.sleep(1.5)
-    if media_group_id in ALBUMS_CACHE:
-        messages = ALBUMS_CACHE.pop(media_group_id)
-        messages.sort(key=lambda m: m.message_id)
-        
-        files_data = [extract_file_data(m) for m in messages if extract_file_data(m)]
-        
-        queue_size = task_queue.qsize()
-        try:
-            await bot.edit_message_text(
-                f"⏳ <b>Albom navbatga qo'shildi</b> ({len(files_data)} ta fayl, oldinda {queue_size} ta vazifa bor)...",
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-            
-        await task_queue.put({
-            "type": "album",
-            "chat_id": chat_id,
-            "active_logo": active_logo,
-            "files": files_data,
-            "status_msg": status_msg
-        })
+async def handle_user_batch_timer(chat_id: int, bot: Bot):
+    """Oxirgi fayl kelganidan so'ng 2 sekund kutadi va Telegram message_id bo'yicha qat'iy tartiblab navbatga qo'shadi."""
+    while True:
+        await asyncio.sleep(0.5)
+        batch = USER_BATCHES.get(chat_id)
+        if not batch:
+            return
+        elapsed = time.time() - batch["last_received"]
+        if elapsed >= 2.0:
+            break
+
+    batch = USER_BATCHES.pop(chat_id, None)
+    if not batch:
+        return
+
+    messages: List[Message] = batch["messages"]
+    active_logo = batch["active_logo"]
+    status_msg: Message = batch["status_msg"]
+
+    # Qat'iy ravishda Telegram message_id bo'yicha tartiblash (eng birinchi yuborilgani birinchi bo'ladi)
+    messages.sort(key=lambda m: m.message_id)
+
+    files_data = [extract_file_data(m) for m in messages if extract_file_data(m)]
+    if not files_data:
+        return
+
+    queue_size = task_queue.qsize()
+    try:
+        await bot.edit_message_text(
+            f"⏳ <b>Barcha fayllar qabul qilindi ({len(files_data)} ta fayl tartib bilan).</b> Navbatga qo'shildi (Oldinda {queue_size} ta vazifa bor)...",
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await task_queue.put({
+        "type": "album",
+        "chat_id": chat_id,
+        "active_logo": active_logo,
+        "files": files_data,
+        "status_msg": status_msg
+    })
 
 
 async def queue_worker_loop(bot: Bot):
@@ -883,28 +901,30 @@ async def handle_incoming_files_in_queue(message: Message, state: FSMContext, bo
             await message.answer("⚠️ Logotip topilmadi! Iltimos, '📁 File logo qo'yish' tugmasini bosing.")
             return
 
-    media_group_id = message.media_group_id
-    if media_group_id:
-        if media_group_id not in ALBUMS_CACHE:
-            ALBUMS_CACHE[media_group_id] = []
-            status_msg = await message.reply("⏳ <b>Albom</b> qabul qilinmoqda...")
-            asyncio.create_task(process_album_after_delay(media_group_id, message.chat.id, active_logo, bot, status_msg))
-        ALBUMS_CACHE[media_group_id].append(message)
+    chat_id = message.chat.id
+    now = time.time()
+
+    if chat_id not in USER_BATCHES:
+        status_msg = await message.reply("⏳ <b>Fayllar qabul qilinmoqda... 2 sekund kutilmoqda...</b>", parse_mode="HTML")
+        USER_BATCHES[chat_id] = {
+            "messages": [message],
+            "active_logo": active_logo,
+            "status_msg": status_msg,
+            "last_received": now,
+            "timer_task": asyncio.create_task(handle_user_batch_timer(chat_id, bot))
+        }
     else:
-        file_data = extract_file_data(message)
-        if not file_data:
-            return
-        
+        batch = USER_BATCHES[chat_id]
+        batch["messages"].append(message)
+        batch["last_received"] = now
+        count = len(batch["messages"])
         try:
-            queue_size = task_queue.qsize()
-            status_msg = await message.reply(f"⏳ Fayl navbatga qo'shildi (Oldinda {queue_size} ta vazifa bor)...")
-            await task_queue.put({
-                "type": "album",
-                "chat_id": message.chat.id,
-                "active_logo": active_logo,
-                "files": [file_data],
-                "status_msg": status_msg
-            })
+            await bot.edit_message_text(
+                f"⏳ <b>Fayllar qabul qilinmoqda ({count} ta fayl)... 2 sekund kutilmoqda...</b>",
+                chat_id=chat_id,
+                message_id=batch["status_msg"].message_id,
+                parse_mode="HTML"
+            )
         except Exception:
             pass
 
