@@ -336,29 +336,38 @@ def process_pdf_file(input_path: str, output_path: str, cover_path: Optional[str
         shutil.copyfile(input_path, output_path)
         return output_path
 
-    doc = fitz.open(input_path)
-    total_pages = len(doc)
-    pw, ph = 595.0, 842.0
-    if total_pages > 0:
-        pw, ph = doc[0].rect.width, doc[0].rect.height
+    try:
+        doc = fitz.open(input_path)
+        if doc.is_encrypted:
+            doc.close()
+            shutil.copyfile(input_path, output_path)
+            return output_path
 
-    if total_pages >= 2:
-        doc.delete_page(total_pages - 1)
-        doc.delete_page(0)
-        front_page = doc.new_page(0, width=pw, height=ph)
-        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
-        back_page = doc.new_page(len(doc), width=pw, height=ph)
-        back_page.insert_image(back_page.rect, filename=cover_path, keep_proportion=True)
-    elif total_pages == 1:
-        doc.delete_page(0)
-        front_page = doc.new_page(0, width=pw, height=ph)
-        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
-    else:
-        front_page = doc.new_page(0, width=pw, height=ph)
-        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+        total_pages = len(doc)
+        pw, ph = 595.0, 842.0
+        if total_pages > 0:
+            pw, ph = doc[0].rect.width, doc[0].rect.height
 
-    doc.save(output_path, garbage=1, deflate=True)
-    doc.close()
+        if total_pages >= 2:
+            doc.delete_page(total_pages - 1)
+            doc.delete_page(0)
+            front_page = doc.new_page(0, width=pw, height=ph)
+            front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+            back_page = doc.new_page(len(doc), width=pw, height=ph)
+            back_page.insert_image(back_page.rect, filename=cover_path, keep_proportion=True)
+        elif total_pages == 1:
+            doc.delete_page(0)
+            front_page = doc.new_page(0, width=pw, height=ph)
+            front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+        else:
+            front_page = doc.new_page(0, width=pw, height=ph)
+            front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+
+        doc.save(output_path, garbage=1, deflate=True)
+        doc.close()
+    except Exception as err:
+        logging.warning(f"PDF processing fallback to original: {err}")
+        shutil.copyfile(input_path, output_path)
     return output_path
 
 
@@ -367,25 +376,28 @@ def process_archive_file(input_path: str, output_path: str, cover_path: Optional
         shutil.copyfile(input_path, output_path)
         return output_path
 
-    with open(cover_path, "rb") as f:
-        cover_bytes = f.read()
+    try:
+        with open(cover_path, "rb") as f:
+            cover_bytes = f.read()
 
-    image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+        image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
 
-    with zipfile.ZipFile(input_path, "r") as z_in:
-        file_list = [f for f in z_in.namelist() if not f.endswith('/')]
-        image_files = sorted([f for f in file_list if f.lower().endswith(image_exts)])
+        with zipfile.ZipFile(input_path, "r") as z_in:
+            file_list = [f for f in z_in.namelist() if not f.endswith('/')]
+            image_files = sorted([f for f in file_list if f.lower().endswith(image_exts)])
 
-        first_img = image_files[0] if image_files else None
-        last_img = image_files[-1] if len(image_files) > 1 else None
+            first_img = image_files[0] if image_files else None
+            last_img = image_files[-1] if len(image_files) > 1 else None
 
-        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as z_out:
-            for item in z_in.infolist():
-                if item.filename == first_img or item.filename == last_img:
-                    z_out.writestr(item.filename, cover_bytes)
-                else:
-                    z_out.writestr(item, z_in.read(item.filename))
-
+            with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as z_out:
+                for item in z_in.infolist():
+                    if item.filename == first_img or item.filename == last_img:
+                        z_out.writestr(item.filename, cover_bytes)
+                    else:
+                        z_out.writestr(item, z_in.read(item.filename))
+    except Exception as err:
+        logging.warning(f"Archive processing fallback to original: {err}")
+        shutil.copyfile(input_path, output_path)
     return output_path
 
 
@@ -497,7 +509,7 @@ async def queue_worker_loop(bot: Bot):
                 for f_type, filename, file_id, file_ext, msg_id in files:
                     input_path = str(temp_dir / f"input_{msg_id}_{filename}")
                     tg_file = await bot.get_file(file_id)
-                    await bot.download_file(tg_file.file_path, input_path)
+                    await bot.download_file(tg_file.file_path, input_path, timeout=3600, chunk_size=1024 * 1024)
                     
                     output_path = str(temp_dir / f"{msg_id}_{filename}")
                     thumb_path = str(temp_dir / f"thumb_{msg_id}.jpg")
@@ -526,9 +538,9 @@ async def queue_worker_loop(bot: Bot):
                     doc_input = FSInputFile(out_p, filename=fn)
                     thumb_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
                     if f_t == "photo":
-                        await bot.send_photo(chat_id, photo=doc_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                        await bot.send_photo(chat_id, photo=doc_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
                     else:
-                        await bot.send_document(chat_id, document=doc_input, thumbnail=thumb_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                        await bot.send_document(chat_id, document=doc_input, thumbnail=thumb_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
                 else:
                     # Telegram does not allow mixing doc and photo in the same media group
                     photo_items = [item for item in processed_media if item[3] == "photo"]
@@ -544,9 +556,9 @@ async def queue_worker_loop(bot: Bot):
                                 fs_input = FSInputFile(out_p, filename=fn)
                                 th_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
                                 if f_t == "photo":
-                                    await bot.send_photo(chat_id, photo=fs_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                                    await bot.send_photo(chat_id, photo=fs_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
                                 else:
-                                    await bot.send_document(chat_id, document=fs_input, thumbnail=th_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                                    await bot.send_document(chat_id, document=fs_input, thumbnail=th_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
                             else:
                                 mg = []
                                 for i, (out_p, th_p, fn, f_t) in enumerate(chunk):
@@ -557,7 +569,7 @@ async def queue_worker_loop(bot: Bot):
                                         mg.append(InputMediaPhoto(media=fs_input, caption=caption, parse_mode="HTML"))
                                     else:
                                         mg.append(InputMediaDocument(media=fs_input, thumbnail=th_input, caption=caption, parse_mode="HTML"))
-                                await bot.send_media_group(chat_id, media=mg)
+                                await bot.send_media_group(chat_id, media=mg, request_timeout=3600)
                             await asyncio.sleep(1)
                         
                 if status_msg:
@@ -567,7 +579,8 @@ async def queue_worker_loop(bot: Bot):
                         pass
             except Exception as e:
                 logging.exception(f"Error processing album: {e}")
-                await edit_status(bot, chat_id, status_msg.message_id, f"❌ <b>Xatolik:</b> <code>{e}</code>")
+                err_msg = str(e) if str(e).strip() else type(e).__name__
+                await edit_status(bot, chat_id, status_msg.message_id, f"❌ <b>Xatolik:</b> <code>{err_msg}</code>")
             finally:
                 if temp_dir.exists():
                     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -665,7 +678,7 @@ async def handle_new_logo_uploaded(message: Message, state: FSMContext, bot: Bot
 
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         tg_file = await bot.get_file(file_id)
-        await bot.download_file(tg_file.file_path, temp_logo_path)
+        await bot.download_file(tg_file.file_path, temp_logo_path, timeout=120)
 
         saved_logo = set_user_saved_logo(user_id, str(temp_logo_path))
         if temp_logo_path.exists():
@@ -738,7 +751,7 @@ async def handle_save_permanent_logo(message: Message, state: FSMContext, bot: B
         temp_path = SAVED_LOGOS_DIR / f"temp_upload_{user_id}.png"
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         tg_file = await bot.get_file(file_id)
-        await bot.download_file(tg_file.file_path, temp_path)
+        await bot.download_file(tg_file.file_path, temp_path, timeout=120)
         set_user_saved_logo(user_id, str(temp_path))
         if temp_path.exists():
             os.remove(temp_path)
@@ -755,7 +768,7 @@ async def cb_save_as_perm(callback: CallbackQuery, state: FSMContext, bot: Bot):
         user_id = callback.from_user.id
         temp_path = SAVED_LOGOS_DIR / f"temp_upload_{user_id}.png"
         tg_file = await bot.get_file(file_id)
-        await bot.download_file(tg_file.file_path, temp_path)
+        await bot.download_file(tg_file.file_path, temp_path, timeout=120)
         set_user_saved_logo(user_id, str(temp_path))
         if temp_path.exists():
             os.remove(temp_path)
@@ -774,7 +787,7 @@ async def cb_save_as_curr(callback: CallbackQuery, state: FSMContext, bot: Bot):
         timestamp = int(time.time() * 1000)
         temp_logo_path = SAVED_LOGOS_DIR / f"temp_{user_id}_{timestamp}.png"
         tg_file = await bot.get_file(file_id)
-        await bot.download_file(tg_file.file_path, temp_logo_path)
+        await bot.download_file(tg_file.file_path, temp_logo_path, timeout=120)
         saved_logo = set_user_saved_logo(user_id, str(temp_logo_path))
         if temp_logo_path.exists():
             try:
