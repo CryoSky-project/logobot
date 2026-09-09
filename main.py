@@ -2,7 +2,7 @@
 """
 LogoBot - Telegram orqali fayllarga (PDF, ZIP, CBZ, rasm va boshqa hujjatlarga) logotip qo'yish.
 - Barcha fayllar QAT'IY KETMA-KETLIKDA BITTADAN (1-by-1) ishlanadi.
-- /done olib tashlangan, fayllar cheksiz yuborilishi mumkin.
+- Albomlar (media group) va yakkalik fayllar to'liq qo'llab-quvvatlanadi.
 - Local Bot API orqali katta fayllarni yuborish imkoniyati qo'shildi.
 """
 
@@ -60,7 +60,7 @@ if env_path.exists():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "8684264908:AAE9FzHZH6LKG6hri8XJdsOvXMwqYlK0I_o"
 PORT = int(os.getenv("PORT", "8000"))
-LOCAL_API_URL = os.getenv("LOCAL_API_URL", "") # e.g. "http://localhost:8081"
+LOCAL_API_URL = os.getenv("LOCAL_API_URL", "")  # e.g. "http://localhost:8081"
 DB_PATH = BASE_DIR / "logobot.db"
 
 SAVED_LOGOS_DIR = BASE_DIR / "saved_logos"
@@ -68,6 +68,8 @@ SAVED_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Qat'iy ketma-ket (1-by-1) ishlash uchun Global Navbat (Queue)
 task_queue = None
+health_server_started = False
+worker_task = None
 
 # =====================================================================
 # SQLITE MA'LUMOTLAR BAZASI
@@ -314,6 +316,101 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 
 
 # =====================================================================
+# FAYLLARNI QAYTA ISHLASH FUNKSIYALARI (PDF, ZIP, CBZ, RASMLAR)
+# =====================================================================
+
+def make_telegram_thumbnail(image_path: str, thumb_path: str) -> str:
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            img.save(thumb_path, "JPEG", quality=85, optimize=True)
+    except Exception:
+        blank = Image.new("RGB", (320, 320), color=(40, 40, 40))
+        blank.save(thumb_path, "JPEG")
+    return thumb_path
+
+
+def process_pdf_file(input_path: str, output_path: str, cover_path: Optional[str] = None) -> str:
+    if not cover_path or not os.path.exists(cover_path):
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    doc = fitz.open(input_path)
+    total_pages = len(doc)
+    pw, ph = 595.0, 842.0
+    if total_pages > 0:
+        pw, ph = doc[0].rect.width, doc[0].rect.height
+
+    if total_pages >= 2:
+        doc.delete_page(total_pages - 1)
+        doc.delete_page(0)
+        front_page = doc.new_page(0, width=pw, height=ph)
+        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+        back_page = doc.new_page(len(doc), width=pw, height=ph)
+        back_page.insert_image(back_page.rect, filename=cover_path, keep_proportion=True)
+    elif total_pages == 1:
+        doc.delete_page(0)
+        front_page = doc.new_page(0, width=pw, height=ph)
+        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+    else:
+        front_page = doc.new_page(0, width=pw, height=ph)
+        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+
+    doc.save(output_path, garbage=1, deflate=True)
+    doc.close()
+    return output_path
+
+
+def process_archive_file(input_path: str, output_path: str, cover_path: Optional[str] = None) -> str:
+    if not cover_path or not os.path.exists(cover_path):
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    with open(cover_path, "rb") as f:
+        cover_bytes = f.read()
+
+    image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+
+    with zipfile.ZipFile(input_path, "r") as z_in:
+        file_list = [f for f in z_in.namelist() if not f.endswith('/')]
+        image_files = sorted([f for f in file_list if f.lower().endswith(image_exts)])
+
+        first_img = image_files[0] if image_files else None
+        last_img = image_files[-1] if len(image_files) > 1 else None
+
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as z_out:
+            for item in z_in.infolist():
+                if item.filename == first_img or item.filename == last_img:
+                    z_out.writestr(item.filename, cover_bytes)
+                else:
+                    z_out.writestr(item, z_in.read(item.filename))
+
+    return output_path
+
+
+def process_image_file(input_path: str, output_path: str, cover_path: Optional[str] = None) -> str:
+    if cover_path and os.path.exists(cover_path):
+        shutil.copyfile(cover_path, output_path)
+    else:
+        shutil.copyfile(input_path, output_path)
+    return output_path
+
+
+def is_image_message(message: Message) -> bool:
+    if message.photo:
+        return True
+    if message.document:
+        if message.document.mime_type and message.document.mime_type.startswith("image/"):
+            return True
+        if message.document.file_name:
+            ext = Path(message.document.file_name).suffix.lower()
+            if ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp'):
+                return True
+    return False
+
+
+# =====================================================================
 # QAT'IY 1-BY-1 KETMA-KETLIK YUKLASH TIZIMI (WORKER)
 # =====================================================================
 
@@ -324,8 +421,7 @@ async def edit_status(bot: Bot, chat_id: int, message_id: int, text: str):
         pass
 
 
-
-ALBUMS_CACHE = {}
+ALBUMS_CACHE: Dict[str, List[Message]] = {}
 
 def extract_file_data(message: Message):
     if message.document:
@@ -339,7 +435,7 @@ def extract_file_data(message: Message):
         return ("photo", filename, file_id, ".jpg", message.message_id)
     return None
 
-async def process_album_after_delay(media_group_id, chat_id, active_logo, bot, status_msg):
+async def process_album_after_delay(media_group_id: str, chat_id: int, active_logo: str, bot: Bot, status_msg: Message):
     await asyncio.sleep(1.5)
     if media_group_id in ALBUMS_CACHE:
         messages = ALBUMS_CACHE.pop(media_group_id)
@@ -349,7 +445,12 @@ async def process_album_after_delay(media_group_id, chat_id, active_logo, bot, s
         
         queue_size = task_queue.qsize()
         try:
-            await bot.edit_message_text(f"⏳ <b>Albom navbatga qo'shildi</b> ({len(files_data)} ta fayl, oldinda {queue_size} ta vazifa bor)...", chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML")
+            await bot.edit_message_text(
+                f"⏳ <b>Albom navbatga qo'shildi</b> ({len(files_data)} ta fayl, oldinda {queue_size} ta vazifa bor)...",
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                parse_mode="HTML"
+            )
         except Exception:
             pass
             
@@ -425,29 +526,39 @@ async def queue_worker_loop(bot: Bot):
                     doc_input = FSInputFile(out_p, filename=fn)
                     thumb_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
                     if f_t == "photo":
-                         await bot.send_photo(chat_id, photo=doc_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                        await bot.send_photo(chat_id, photo=doc_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
                     else:
-                         await bot.send_document(chat_id, document=doc_input, thumbnail=thumb_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                        await bot.send_document(chat_id, document=doc_input, thumbnail=thumb_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
                 else:
-                    media_group = []
-                    for i, (out_p, th_p, fn, f_t) in enumerate(processed_media):
-                        fs_input = FSInputFile(out_p, filename=fn)
-                        th_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
-                        
-                        caption = f"✅ <b>Tayyor:</b> <code>{fn}</code>" if i == 0 else ""
-                        
-                        if f_t == "photo":
-                            media_group.append(InputMediaPhoto(media=fs_input, caption=caption, parse_mode="HTML"))
-                        else:
-                            media_group.append(InputMediaDocument(media=fs_input, thumbnail=th_input, caption=caption, parse_mode="HTML"))
-                            
-                        if len(media_group) == 10:
-                            await bot.send_media_group(chat_id, media=media_group)
-                            media_group = []
+                    # Telegram does not allow mixing doc and photo in the same media group
+                    photo_items = [item for item in processed_media if item[3] == "photo"]
+                    doc_items = [item for item in processed_media if item[3] != "photo"]
+
+                    for group_items in (photo_items, doc_items):
+                        if not group_items:
+                            continue
+                        for chunk_start in range(0, len(group_items), 10):
+                            chunk = group_items[chunk_start:chunk_start + 10]
+                            if len(chunk) == 1:
+                                out_p, th_p, fn, f_t = chunk[0]
+                                fs_input = FSInputFile(out_p, filename=fn)
+                                th_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
+                                if f_t == "photo":
+                                    await bot.send_photo(chat_id, photo=fs_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                                else:
+                                    await bot.send_document(chat_id, document=fs_input, thumbnail=th_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML")
+                            else:
+                                mg = []
+                                for i, (out_p, th_p, fn, f_t) in enumerate(chunk):
+                                    fs_input = FSInputFile(out_p, filename=fn)
+                                    th_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
+                                    caption = f"✅ <b>Tayyor:</b> <code>{fn}</code>" if i == 0 else ""
+                                    if f_t == "photo":
+                                        mg.append(InputMediaPhoto(media=fs_input, caption=caption, parse_mode="HTML"))
+                                    else:
+                                        mg.append(InputMediaDocument(media=fs_input, thumbnail=th_input, caption=caption, parse_mode="HTML"))
+                                await bot.send_media_group(chat_id, media=mg)
                             await asyncio.sleep(1)
-                            
-                    if media_group:
-                        await bot.send_media_group(chat_id, media=media_group)
                         
                 if status_msg:
                     try:
@@ -465,12 +576,288 @@ async def queue_worker_loop(bot: Bot):
 
 
 # =====================================================================
+# ASOSIY MENYU VA START HANDLERS
+# =====================================================================
+@router.message(CommandStart())
+@router.message(F.text.in_(["🔙 Asosiy menyu", "🔙 Bekor qilish (Asosiy menyuga qaytish)"]))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    saved_logo = get_user_saved_logo(user.id)
+    logo_status = "✅ O'rnatilgan" if saved_logo else "❌ O'rnatilmagan"
+    
+    limit_status = "🚀 2000 MB (Local Bot API)" if LOCAL_API_URL else "📦 50 MB"
+
+    text = (
+        f"👋 <b>Assalomu alaykum, {user.first_name}!</b>\n\n"
+        f"🤖 <b>LogoBot boshqaruv paneliga xush kelibsiz.</b>\n\n"
+        f"📌 <b>Holat:</b>\n"
+        f"• Sizning ID: <code>{user.id}</code> (Admin)\n"
+        f"• Doimiy logotip: <b>{logo_status}</b>\n"
+        f"• Maksimal fayl hajmi: <b>{limit_status}</b>\n\n"
+        f"👇 <i>Fayllarga logotip qo'yish uchun quyidagi tugmani bosing:</i>"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+# =====================================================================
+# FILE LOGO QO'YISH BOSQICHI
+# =====================================================================
+@router.message(F.text == "📁 File logo qo'yish")
+async def cmd_file_logo_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    saved_logo = get_user_saved_logo(user_id)
+    has_saved = bool(saved_logo and os.path.exists(saved_logo))
+
+    text = "🖌️ <b>Fayllarga qaysi logotipni qo'ymoqchisiz?</b>\n\nTanlang:"
+    await message.answer(text, parse_mode="HTML", reply_markup=logo_choice_kb(has_saved))
+
+
+@router.callback_query(F.data == "choice_saved_logo")
+async def cb_choice_saved_logo(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    saved_logo = get_user_saved_logo(user_id)
+
+    if not saved_logo or not os.path.exists(saved_logo):
+        await callback.answer("⚠️ Saqlangan logotip topilmadi!", show_alert=True)
+        return
+
+    await state.update_data(active_logo=saved_logo)
+    await state.set_state(BotStates.waiting_for_files)
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    text = (
+        "✅ <b>Saqlangan logotip tanlandi!</b>\n\n"
+        "📤 <b>Endi fayllarni yuboring:</b>\n"
+        "<i>(Fayllarni cheksiz miqdorda yuboraverishingiz mumkin. Bot ularni navbatma-navbat ishlashda davom etadi.)</i>\n\n"
+        "Tugatish uchun pastdagi <b>«🔙 Bekor qilish»</b> tugmasini bosing."
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "choice_new_logo")
+async def cb_choice_new_logo(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_new_logo)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    text = "📸 <b>Fayllarga qo'yiladigan yangi LOGOTIP rasmini (PNG / JPG) yuboring:</b>"
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_to_main_kb())
+    await callback.answer()
+
+
+@router.message(BotStates.waiting_for_new_logo)
+async def handle_new_logo_uploaded(message: Message, state: FSMContext, bot: Bot):
+    if not is_image_message(message):
+        await message.answer("⚠️ Iltimos, faqat rasm (PNG / JPG) formatida logotip yuboring!")
+        return
+    try:
+        user_id = message.from_user.id
+        timestamp = int(time.time() * 1000)
+        temp_logo_path = SAVED_LOGOS_DIR / f"temp_{user_id}_{timestamp}.png"
+
+        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+        tg_file = await bot.get_file(file_id)
+        await bot.download_file(tg_file.file_path, temp_logo_path)
+
+        saved_logo = set_user_saved_logo(user_id, str(temp_logo_path))
+        if temp_logo_path.exists():
+            try:
+                os.remove(temp_logo_path)
+            except Exception:
+                pass
+        await state.update_data(active_logo=saved_logo)
+        await state.set_state(BotStates.waiting_for_files)
+
+        text = (
+            "✅ <b>Yangi logotip qabul qilindi va saqlandi!</b>\n\n"
+            "📤 <b>Endi fayllarni yuboring:</b>\n"
+            "<i>(Fayllarni cheksiz miqdorda yuboraverishingiz mumkin. Bot ularni navbatma-navbat ishlashda davom etadi.)</i>\n\n"
+            "Tugatish uchun pastdagi <b>«🔙 Bekor qilish»</b> tugmasini bosing."
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
+    except Exception as e:
+        await message.answer(f"❌ Logotipni yuklab olishda xatolik: {e}")
+
+
+# =====================================================================
+# DOIMIY LOGOTIP VA ADMINLAR
+# =====================================================================
+@router.message(F.text == "🖼️ Doimiy logotip")
+async def cmd_saved_logo_menu(message: Message):
+    user_id = message.from_user.id
+    saved_logo = get_user_saved_logo(user_id)
+
+    if saved_logo and os.path.exists(saved_logo):
+        await message.answer_photo(
+            photo=FSInputFile(saved_logo),
+            caption="✅ <b>Sizning saqlangan doimiy logotipingiz.</b>\n\nFaylga logo qo'yishda har safar rasm yubormasdan, shu logotipdan foydalanishingiz mumkin.",
+            parse_mode="HTML",
+            reply_markup=saved_logo_menu_kb(has_saved_logo=True)
+        )
+    else:
+        await message.answer(
+            "ℹ️ <b>Sizda hali doimiy logotip saqlanmagan.</b>\nLogotip saqlash uchun quyidagi tugmani bosing:",
+            parse_mode="HTML",
+            reply_markup=saved_logo_menu_kb(has_saved_logo=False)
+        )
+
+@router.callback_query(F.data == "upload_permanent_logo")
+async def cb_upload_permanent_logo(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_permanent_logo)
+    await callback.message.answer("📸 <b>Doimiy logotip sifatida saqlamoqchi bo'lgan RASMNI yuboring:</b>", parse_mode="HTML", reply_markup=cancel_to_main_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "del_saved_logo")
+async def cb_del_saved_logo(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    clear_user_saved_logo(user_id)
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption(caption="🗑️ <b>Doimiy logotip o'chirildi!</b>", parse_mode="HTML")
+        else:
+            await callback.message.edit_text("🗑️ <b>Doimiy logotip o'chirildi!</b>", parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer("O'chirildi")
+
+@router.message(BotStates.waiting_for_permanent_logo)
+async def handle_save_permanent_logo(message: Message, state: FSMContext, bot: Bot):
+    if not is_image_message(message):
+        await message.answer("⚠️ Iltimos, faqat rasm (PNG / JPG) formatida logotip yuboring!")
+        return
+    try:
+        user_id = message.from_user.id
+        temp_path = SAVED_LOGOS_DIR / f"temp_upload_{user_id}.png"
+        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+        tg_file = await bot.get_file(file_id)
+        await bot.download_file(tg_file.file_path, temp_path)
+        set_user_saved_logo(user_id, str(temp_path))
+        if temp_path.exists():
+            os.remove(temp_path)
+        await state.clear()
+        await message.answer("✅ <b>Doimiy logotip muvaffaqiyatli saqlandi!</b>", parse_mode="HTML", reply_markup=main_menu_kb())
+    except Exception as e:
+        await message.answer(f"❌ Doimiy logotipni saqlashda xatolik: {e}")
+
+
+@router.callback_query(F.data.startswith("save_as_perm:"))
+async def cb_save_as_perm(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    file_id = callback.data.split(":", 1)[1]
+    try:
+        user_id = callback.from_user.id
+        temp_path = SAVED_LOGOS_DIR / f"temp_upload_{user_id}.png"
+        tg_file = await bot.get_file(file_id)
+        await bot.download_file(tg_file.file_path, temp_path)
+        set_user_saved_logo(user_id, str(temp_path))
+        if temp_path.exists():
+            os.remove(temp_path)
+        await state.clear()
+        await callback.message.edit_text("✅ <b>Doimiy logotip muvaffaqiyatli saqlandi!</b>", parse_mode="HTML")
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Xatolik: {e}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("save_as_curr:"))
+async def cb_save_as_curr(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    file_id = callback.data.split(":", 1)[1]
+    try:
+        user_id = callback.from_user.id
+        timestamp = int(time.time() * 1000)
+        temp_logo_path = SAVED_LOGOS_DIR / f"temp_{user_id}_{timestamp}.png"
+        tg_file = await bot.get_file(file_id)
+        await bot.download_file(tg_file.file_path, temp_logo_path)
+        saved_logo = set_user_saved_logo(user_id, str(temp_logo_path))
+        if temp_logo_path.exists():
+            try:
+                os.remove(temp_logo_path)
+            except Exception:
+                pass
+        await state.update_data(active_logo=saved_logo)
+        await state.set_state(BotStates.waiting_for_files)
+        await callback.message.edit_text(
+            "✅ <b>Logotip tanlandi!</b>\n\n📤 <b>Endi fayllarni yuboring:</b>",
+            parse_mode="HTML"
+        )
+        await callback.message.answer("Fayllarni yuborishingiz mumkin:", reply_markup=files_receiving_kb())
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Xatolik: {e}")
+    await callback.answer()
+
+@router.message(F.text == "👥 Adminlar")
+async def cmd_admins_menu(message: Message):
+    admins = get_admins()
+    admin_list_text = ""
+    for idx, adm in enumerate(admins, 1):
+        uname = f"@{adm['username']}" if adm.get('username') else "username yo'q"
+        name = adm.get('full_name') or "Admin"
+        admin_list_text += f"{idx}. <b>{name}</b> — <code>{adm['user_id']}</code> ({uname})\n"
+    text = f"👥 <b>Barcha adminlar ro'yxati ({len(admins)} ta):</b>\n\n{admin_list_text}\n👇 <i>Admin qo'shish yoki o'chirish uchun quyidagi tugmalardan foydalaning:</i>"
+    await message.answer(text, parse_mode="HTML", reply_markup=admin_panel_kb())
+
+@router.callback_query(F.data == "admin_add_prompt")
+async def cb_admin_add_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_admin_id)
+    await callback.message.answer("✍️ <b>Qo'shmoqchi bo'lgan yangi adminning Telegram ID raqamini yuboring:</b>\n\n<i>Masalan: <code>1234567890</code></i>", parse_mode="HTML", reply_markup=cancel_to_main_kb())
+    await callback.answer()
+
+@router.message(BotStates.waiting_for_admin_id)
+async def handle_admin_id_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("⚠️ Iltimos, faqat raqamlardan iborat to'g'ri Telegram ID yuboring!")
+        return
+    new_admin_id = int(text)
+    success = add_admin(user_id=new_admin_id, username=None, full_name="Yangi Admin", added_by=message.from_user.id)
+    await state.clear()
+    if success:
+        await message.answer(f"✅ <b>Yangi admin qo'shildi:</b> <code>{new_admin_id}</code>", parse_mode="HTML", reply_markup=main_menu_kb())
+    else:
+        await message.answer("❌ Adminni qo'shishda xatolik yuz berdi.", reply_markup=main_menu_kb())
+
+@router.callback_query(F.data == "admin_remove_list")
+async def cb_admin_remove_list(callback: CallbackQuery):
+    admins = get_admins()
+    buttons = [[InlineKeyboardButton(text=f"❌ O'chirish: {adm['user_id']}", callback_data=f"del_adm:{adm['user_id']}")] for adm in admins]
+    buttons.append([InlineKeyboardButton(text="🔙 Bekor qilish", callback_data="cancel_action")])
+    await callback.message.edit_text("➖ <b>O'chirmoqchi bo'lgan adminni tanlang:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("del_adm:"))
+async def cb_delete_admin(callback: CallbackQuery):
+    target_id = int(callback.data.split(":")[1])
+    admins = get_admins()
+    if len(admins) <= 1:
+        await callback.answer("⚠️ Botda kamida 1 ta admin qolishi shart!", show_alert=True)
+        return
+    remove_admin(target_id)
+    await callback.message.edit_text(f"🗑️ <b>Admin o'chirildi:</b> <code>{target_id}</code>", parse_mode="HTML")
+    await callback.answer("O'chirildi")
+
+@router.callback_query(F.data == "cancel_action")
+async def cb_cancel_action(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer("🔙 Asosiy menyu", reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+# =====================================================================
 # QAT'IY KETMA-KET NAVBATGA QO'SHISH (1-BY-1)
 # =====================================================================
 @router.message(BotStates.waiting_for_files, F.document | F.photo)
-async def handle_incoming_files_in_queue(message: Message,
-    InputMediaPhoto,
-    InputMediaDocument, state: FSMContext, bot: Bot):
+async def handle_incoming_files_in_queue(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     active_logo = data.get("active_logo")
 
@@ -492,7 +879,8 @@ async def handle_incoming_files_in_queue(message: Message,
         ALBUMS_CACHE[media_group_id].append(message)
     else:
         file_data = extract_file_data(message)
-        if not file_data: return
+        if not file_data:
+            return
         
         try:
             queue_size = task_queue.qsize()
@@ -508,9 +896,7 @@ async def handle_incoming_files_in_queue(message: Message,
             pass
 
 @router.message()
-async def handle_direct_photo_upload(message: Message,
-    InputMediaPhoto,
-    InputMediaDocument, state: FSMContext, bot: Bot):
+async def handle_direct_photo_upload(message: Message, state: FSMContext, bot: Bot):
     current_state = await state.get_state()
     if current_state in (BotStates.waiting_for_files, BotStates.waiting_for_new_logo, BotStates.waiting_for_permanent_logo, BotStates.waiting_for_admin_id):
         return
@@ -551,13 +937,19 @@ async def run_health_server():
 # POLLING STARTUP VA SHUTDOWN
 # =====================================================================
 async def on_startup(bot: Bot, dp: Dispatcher):
-    global task_queue
+    global task_queue, health_server_started, worker_task
     if task_queue is None:
         task_queue = asyncio.Queue()
     init_db()
 
-    asyncio.create_task(run_health_server())
-    asyncio.create_task(queue_worker_loop(bot))
+    if not health_server_started:
+        asyncio.create_task(run_health_server())
+        health_server_started = True
+
+    if worker_task is not None:
+        worker_task.cancel()
+    worker_task = asyncio.create_task(queue_worker_loop(bot))
+
     await bot.delete_webhook(drop_pending_updates=True)
 
 
