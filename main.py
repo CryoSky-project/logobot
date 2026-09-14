@@ -15,6 +15,7 @@ import sqlite3
 import asyncio
 import logging
 import zipfile
+import html
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -430,7 +431,11 @@ async def edit_status(bot: Bot, chat_id: int, message_id: int, text: str):
     try:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="HTML")
     except Exception:
-        pass
+        try:
+            clean = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
+            await bot.edit_message_text(clean, chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
 
 
 USER_BATCHES: Dict[int, Dict[str, Any]] = {}
@@ -570,13 +575,14 @@ async def queue_worker_loop(bot: Bot):
                 for idx, (f_type, filename, file_id, file_ext, msg_id) in enumerate(files, 1):
                     item_dir = temp_dir / f"item_{idx}"
                     item_dir.mkdir(parents=True, exist_ok=True)
+                    safe_fn = html.escape(filename)
                     try:
                         # 1. Holat xabari
                         if status_msg:
                             status_text = (
-                                f"⚙️ <b>Qayta ishlanmoqda ({idx}/{total_files}):</b>\n<code>{filename}</code>"
+                                f"⚙️ <b>Qayta ishlanmoqda ({idx}/{total_files}):</b>\n<code>{safe_fn}</code>"
                                 if total_files > 1
-                                else f"⚙️ <b>Qayta ishlanmoqda:</b>\n<code>{filename}</code>"
+                                else f"⚙️ <b>Qayta ishlanmoqda:</b>\n<code>{safe_fn}</code>"
                             )
                             await edit_status(bot, chat_id, status_msg.message_id, status_text)
 
@@ -609,28 +615,47 @@ async def queue_worker_loop(bot: Bot):
                         fs_input = FSInputFile(output_path, filename=filename)
                         thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
                         caption_text = (
-                            f"✅ <b>Tayyor ({idx}/{total_files}):</b> <code>{filename}</code>"
+                            f"✅ <b>Tayyor ({idx}/{total_files}):</b> <code>{safe_fn}</code>"
                             if total_files > 1
-                            else f"✅ <b>Tayyor:</b> <code>{filename}</code>"
+                            else f"✅ <b>Tayyor:</b> <code>{safe_fn}</code>"
                         )
 
                         if f_type == "photo":
-                            await bot.send_photo(
-                                chat_id,
-                                photo=fs_input,
-                                caption=caption_text,
-                                parse_mode="HTML",
-                                request_timeout=3600
-                            )
+                            try:
+                                await bot.send_photo(
+                                    chat_id,
+                                    photo=fs_input,
+                                    caption=caption_text,
+                                    parse_mode="HTML",
+                                    request_timeout=3600
+                                )
+                            except Exception as send_err:
+                                logging.warning(f"send_photo HTML parse fallback: {send_err}")
+                                await bot.send_photo(
+                                    chat_id,
+                                    photo=fs_input,
+                                    caption=f"✅ Tayyor ({idx}/{total_files}): {filename}",
+                                    request_timeout=3600
+                                )
                         else:
-                            await bot.send_document(
-                                chat_id,
-                                document=fs_input,
-                                thumbnail=thumb_input,
-                                caption=caption_text,
-                                parse_mode="HTML",
-                                request_timeout=3600
-                            )
+                            try:
+                                await bot.send_document(
+                                    chat_id,
+                                    document=fs_input,
+                                    thumbnail=thumb_input,
+                                    caption=caption_text,
+                                    parse_mode="HTML",
+                                    request_timeout=3600
+                                )
+                            except Exception as send_err:
+                                logging.warning(f"send_document HTML parse fallback: {send_err}")
+                                await bot.send_document(
+                                    chat_id,
+                                    document=fs_input,
+                                    thumbnail=thumb_input,
+                                    caption=f"✅ Tayyor ({idx}/{total_files}): {filename}",
+                                    request_timeout=3600
+                                )
 
                         await asyncio.sleep(0.5)
 
@@ -640,11 +665,17 @@ async def queue_worker_loop(bot: Bot):
                         try:
                             await bot.send_message(
                                 chat_id,
-                                f"❌ <b>Xatolik ({idx}/{total_files}):</b> <code>{filename}</code>\n<i>{err_text}</i>",
+                                f"❌ <b>Xatolik ({idx}/{total_files}):</b> <code>{safe_fn}</code>\n<i>{html.escape(err_text)}</i>",
                                 parse_mode="HTML"
                             )
                         except Exception:
-                            pass
+                            try:
+                                await bot.send_message(
+                                    chat_id,
+                                    f"❌ Xatolik ({idx}/{total_files}): {filename}\n{err_text}"
+                                )
+                            except Exception:
+                                pass
                     finally:
                         if item_dir.exists():
                             shutil.rmtree(item_dir, ignore_errors=True)
@@ -653,12 +684,19 @@ async def queue_worker_loop(bot: Bot):
                     try:
                         await bot.delete_message(chat_id, status_msg.message_id)
                     except Exception:
-                        pass
+                        try:
+                            await bot.edit_message_text(
+                                f"✅ Barcha fayllar ({total_files} ta) muvaffaqiyatli tayyorlandi!",
+                                chat_id=chat_id,
+                                message_id=status_msg.message_id
+                            )
+                        except Exception:
+                            pass
             except Exception as e:
                 logging.exception(f"Error processing task: {e}")
                 err_msg = str(e) if str(e).strip() else type(e).__name__
                 if status_msg:
-                    await edit_status(bot, chat_id, status_msg.message_id, f"❌ <b>Umumiy xatolik:</b> <code>{err_msg}</code>")
+                    await edit_status(bot, chat_id, status_msg.message_id, f"❌ <b>Umumiy xatolik:</b> <code>{html.escape(err_msg)}</code>")
             finally:
                 if temp_dir.exists():
                     shutil.rmtree(temp_dir, ignore_errors=True)
