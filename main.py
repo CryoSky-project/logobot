@@ -449,12 +449,44 @@ def extract_file_data(message: Message):
 
 async def handle_user_batch_timer(chat_id: int, bot: Bot):
     """Oxirgi fayl kelganidan so'ng 2 sekund kutadi va Telegram message_id bo'yicha qat'iy tartiblab navbatga qo'shadi."""
+    await asyncio.sleep(0.3)
+    batch = USER_BATCHES.get(chat_id)
+    if not batch or not batch.get("messages"):
+        return
+
+    if not batch.get("status_msg"):
+        try:
+            cnt = len(batch["messages"])
+            batch["status_msg"] = await bot.send_message(
+                chat_id,
+                f"⏳ <b>Fayllar qabul qilinmoqda ({cnt} ta)...</b>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.warning(f"Status xabar yuborishda xatolik: {e}")
+
+    last_count = len(batch["messages"])
     while True:
         await asyncio.sleep(0.5)
         batch = USER_BATCHES.get(chat_id)
         if not batch:
             return
+
         elapsed = time.time() - batch["last_received"]
+        current_count = len(batch["messages"])
+
+        if current_count != last_count and batch.get("status_msg"):
+            last_count = current_count
+            try:
+                await bot.edit_message_text(
+                    f"⏳ <b>Fayllar qabul qilinmoqda ({current_count} ta)...</b>",
+                    chat_id=chat_id,
+                    message_id=batch["status_msg"].message_id,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
         if elapsed >= 2.0:
             break
 
@@ -464,25 +496,39 @@ async def handle_user_batch_timer(chat_id: int, bot: Bot):
 
     messages: List[Message] = batch["messages"]
     active_logo = batch["active_logo"]
-    status_msg: Message = batch["status_msg"]
+    status_msg = batch.get("status_msg")
 
-    # Qat'iy ravishda Telegram message_id bo'yicha tartiblash (eng birinchi yuborilgani birinchi bo'ladi)
+    # Qat'iy ravishda Telegram message_id bo'yicha tartiblash (Telegram bo'yicha eng birinchi yuborilgani birinchi bo'ladi)
     messages.sort(key=lambda m: m.message_id)
 
-    files_data = [extract_file_data(m) for m in messages if extract_file_data(m)]
+    files_data = []
+    seen_ids = set()
+    for m in messages:
+        if m.message_id not in seen_ids:
+            seen_ids.add(m.message_id)
+            fdata = extract_file_data(m)
+            if fdata:
+                files_data.append(fdata)
+
     if not files_data:
+        if status_msg:
+            try:
+                await bot.delete_message(chat_id, status_msg.message_id)
+            except Exception:
+                pass
         return
 
     queue_size = task_queue.qsize()
-    try:
-        await bot.edit_message_text(
-            f"⏳ <b>Barcha fayllar qabul qilindi ({len(files_data)} ta fayl tartib bilan).</b> Navbatga qo'shildi (Oldinda {queue_size} ta vazifa bor)...",
-            chat_id=chat_id,
-            message_id=status_msg.message_id,
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    if status_msg:
+        try:
+            await bot.edit_message_text(
+                f"⏳ <b>Barcha fayllar qabul qilindi ({len(files_data)} ta fayl tartib bilan).</b>\nNavbatga qo'shildi (Oldinda {queue_size} ta vazifa bor)...",
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
     await task_queue.put({
         "type": "album",
@@ -513,97 +559,111 @@ async def queue_worker_loop(bot: Bot):
             chat_id = task["chat_id"]
             active_logo = task["active_logo"]
             files = task["files"]
-            status_msg = task["status_msg"]
+            status_msg = task.get("status_msg")
             
             job_id = uuid.uuid4().hex[:8]
             temp_dir = Path(f"/tmp/job_{job_id}")
             temp_dir.mkdir(parents=True, exist_ok=True)
             
             try:
-                processed_media = []
-                
-                await edit_status(bot, chat_id, status_msg.message_id, f"📥 <b>Navbat keldi:</b> {len(files)} ta fayl yuklab olinmoqda va qayta ishlanmoqda...")
-                
-                for f_type, filename, file_id, file_ext, msg_id in files:
-                    input_path = str(temp_dir / f"input_{msg_id}_{filename}")
-                    tg_file = await bot.get_file(file_id)
-                    await bot.download_file(tg_file.file_path, input_path, timeout=3600, chunk_size=1024 * 1024)
-                    
-                    output_path = str(temp_dir / f"{msg_id}_{filename}")
-                    thumb_path = str(temp_dir / f"thumb_{msg_id}.jpg")
-                    has_thumb = False
-                    
-                    if active_logo and os.path.exists(active_logo):
-                        make_telegram_thumbnail(active_logo, thumb_path)
-                        has_thumb = True
-                        
-                    if file_ext == ".pdf":
-                        process_pdf_file(input_path, output_path, active_logo)
-                    elif file_ext in (".zip", ".cbz"):
-                        process_archive_file(input_path, output_path, active_logo)
-                    elif file_ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
-                        process_image_file(input_path, output_path, active_logo)
-                    else:
-                        shutil.copyfile(input_path, output_path)
-                        
-                    processed_media.append((output_path, thumb_path if has_thumb else None, filename, f_type))
-                    log_processed_file(chat_id, filename, file_ext)
-                
-                await edit_status(bot, chat_id, status_msg.message_id, "📤 Qayta ishlangan fayllar yuborilmoqda...")
-                
-                if len(processed_media) == 1:
-                    out_p, th_p, fn, f_t = processed_media[0]
-                    doc_input = FSInputFile(out_p, filename=fn)
-                    thumb_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
-                    if f_t == "photo":
-                        await bot.send_photo(chat_id, photo=doc_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
-                    else:
-                        await bot.send_document(chat_id, document=doc_input, thumbnail=thumb_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
-                else:
-                    # Telegram does not allow mixing doc and photo in the same media group
-                    photo_items = [item for item in processed_media if item[3] == "photo"]
-                    doc_items = [item for item in processed_media if item[3] != "photo"]
+                total_files = len(files)
+                for idx, (f_type, filename, file_id, file_ext, msg_id) in enumerate(files, 1):
+                    item_dir = temp_dir / f"item_{idx}"
+                    item_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        # 1. Holat xabari
+                        if status_msg:
+                            status_text = (
+                                f"⚙️ <b>Qayta ishlanmoqda ({idx}/{total_files}):</b>\n<code>{filename}</code>"
+                                if total_files > 1
+                                else f"⚙️ <b>Qayta ishlanmoqda:</b>\n<code>{filename}</code>"
+                            )
+                            await edit_status(bot, chat_id, status_msg.message_id, status_text)
 
-                    for group_items in (photo_items, doc_items):
-                        if not group_items:
-                            continue
-                        for chunk_start in range(0, len(group_items), 10):
-                            chunk = group_items[chunk_start:chunk_start + 10]
-                            if len(chunk) == 1:
-                                out_p, th_p, fn, f_t = chunk[0]
-                                fs_input = FSInputFile(out_p, filename=fn)
-                                th_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
-                                if f_t == "photo":
-                                    await bot.send_photo(chat_id, photo=fs_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
-                                else:
-                                    await bot.send_document(chat_id, document=fs_input, thumbnail=th_input, caption=f"✅ <b>Tayyor:</b> <code>{fn}</code>", parse_mode="HTML", request_timeout=3600)
-                            else:
-                                mg = []
-                                for i, (out_p, th_p, fn, f_t) in enumerate(chunk):
-                                    fs_input = FSInputFile(out_p, filename=fn)
-                                    th_input = FSInputFile(th_p) if th_p and os.path.exists(th_p) else None
-                                    caption = f"✅ <b>Tayyor:</b> <code>{fn}</code>" if i == 0 else ""
-                                    if f_t == "photo":
-                                        mg.append(InputMediaPhoto(media=fs_input, caption=caption, parse_mode="HTML"))
-                                    else:
-                                        mg.append(InputMediaDocument(media=fs_input, thumbnail=th_input, caption=caption, parse_mode="HTML"))
-                                await bot.send_media_group(chat_id, media=mg, request_timeout=3600)
-                            await asyncio.sleep(1)
-                        
+                        # 2. Faylni yuklab olish
+                        input_path = str(item_dir / f"in_{filename}")
+                        tg_file = await bot.get_file(file_id)
+                        await bot.download_file(tg_file.file_path, input_path, timeout=3600, chunk_size=1024 * 1024)
+
+                        # 3. Logotip qo'yish
+                        output_path = str(item_dir / f"out_{filename}")
+                        thumb_path = str(item_dir / f"thumb_{idx}.jpg")
+                        has_thumb = False
+
+                        if active_logo and os.path.exists(active_logo):
+                            make_telegram_thumbnail(active_logo, thumb_path)
+                            has_thumb = True
+
+                        if file_ext == ".pdf":
+                            process_pdf_file(input_path, output_path, active_logo)
+                        elif file_ext in (".zip", ".cbz"):
+                            process_archive_file(input_path, output_path, active_logo)
+                        elif file_ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                            process_image_file(input_path, output_path, active_logo)
+                        else:
+                            shutil.copyfile(input_path, output_path)
+
+                        log_processed_file(chat_id, filename, file_ext)
+
+                        # 4. Foydalanuvchiga bittadan (1-by-1) ketma-ket yuborish
+                        fs_input = FSInputFile(output_path, filename=filename)
+                        thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
+                        caption_text = (
+                            f"✅ <b>Tayyor ({idx}/{total_files}):</b> <code>{filename}</code>"
+                            if total_files > 1
+                            else f"✅ <b>Tayyor:</b> <code>{filename}</code>"
+                        )
+
+                        if f_type == "photo":
+                            await bot.send_photo(
+                                chat_id,
+                                photo=fs_input,
+                                caption=caption_text,
+                                parse_mode="HTML",
+                                request_timeout=3600
+                            )
+                        else:
+                            await bot.send_document(
+                                chat_id,
+                                document=fs_input,
+                                thumbnail=thumb_input,
+                                caption=caption_text,
+                                parse_mode="HTML",
+                                request_timeout=3600
+                            )
+
+                        await asyncio.sleep(0.5)
+
+                    except Exception as item_err:
+                        logging.exception(f"Error processing item {filename}: {item_err}")
+                        err_text = str(item_err) if str(item_err).strip() else type(item_err).__name__
+                        try:
+                            await bot.send_message(
+                                chat_id,
+                                f"❌ <b>Xatolik ({idx}/{total_files}):</b> <code>{filename}</code>\n<i>{err_text}</i>",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                    finally:
+                        if item_dir.exists():
+                            shutil.rmtree(item_dir, ignore_errors=True)
+
                 if status_msg:
                     try:
                         await bot.delete_message(chat_id, status_msg.message_id)
                     except Exception:
                         pass
             except Exception as e:
-                logging.exception(f"Error processing album: {e}")
+                logging.exception(f"Error processing task: {e}")
                 err_msg = str(e) if str(e).strip() else type(e).__name__
-                await edit_status(bot, chat_id, status_msg.message_id, f"❌ <b>Xatolik:</b> <code>{err_msg}</code>")
+                if status_msg:
+                    await edit_status(bot, chat_id, status_msg.message_id, f"❌ <b>Umumiy xatolik:</b> <code>{err_msg}</code>")
             finally:
                 if temp_dir.exists():
                     shutil.rmtree(temp_dir, ignore_errors=True)
                 task_queue.task_done()
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
 
 # =====================================================================
@@ -613,6 +673,7 @@ async def queue_worker_loop(bot: Bot):
 @router.message(F.text.in_(["🔙 Asosiy menyu", "🔙 Bekor qilish (Asosiy menyuga qaytish)"]))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    USER_BATCHES.pop(message.chat.id, None)
     user = message.from_user
     saved_logo = get_user_saved_logo(user.id)
     logo_status = "✅ O'rnatilgan" if saved_logo else "❌ O'rnatilmagan"
@@ -904,29 +965,46 @@ async def handle_incoming_files_in_queue(message: Message, state: FSMContext, bo
     chat_id = message.chat.id
     now = time.time()
 
+    # Race conditiondan himoyalangan sinxron navbatga yig'ish
     if chat_id not in USER_BATCHES:
-        status_msg = await message.reply("⏳ <b>Fayllar qabul qilinmoqda... 2 sekund kutilmoqda...</b>", parse_mode="HTML")
         USER_BATCHES[chat_id] = {
-            "messages": [message],
+            "messages": [],
             "active_logo": active_logo,
-            "status_msg": status_msg,
+            "status_msg": None,
             "last_received": now,
-            "timer_task": asyncio.create_task(handle_user_batch_timer(chat_id, bot))
+            "timer_task": None
         }
-    else:
-        batch = USER_BATCHES[chat_id]
+
+    batch = USER_BATCHES[chat_id]
+    if not any(m.message_id == message.message_id for m in batch["messages"]):
         batch["messages"].append(message)
-        batch["last_received"] = now
-        count = len(batch["messages"])
-        try:
-            await bot.edit_message_text(
-                f"⏳ <b>Fayllar qabul qilinmoqda ({count} ta fayl)... 2 sekund kutilmoqda...</b>",
-                chat_id=chat_id,
-                message_id=batch["status_msg"].message_id,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+    batch["last_received"] = now
+    batch["active_logo"] = active_logo
+
+    if batch.get("timer_task") is None or batch["timer_task"].done():
+        batch["timer_task"] = asyncio.create_task(handle_user_batch_timer(chat_id, bot))
+
+
+@router.message(F.document)
+async def handle_direct_document_upload(message: Message, state: FSMContext, bot: Bot):
+    current_state = await state.get_state()
+    if current_state in (BotStates.waiting_for_new_logo, BotStates.waiting_for_permanent_logo, BotStates.waiting_for_admin_id):
+        return
+
+    user_id = message.from_user.id
+    saved_logo = get_user_saved_logo(user_id)
+    if saved_logo and os.path.exists(saved_logo):
+        await state.update_data(active_logo=saved_logo)
+        await state.set_state(BotStates.waiting_for_files)
+        await handle_incoming_files_in_queue(message, state, bot)
+    else:
+        await message.answer(
+            "⚠️ <b>Logotip tanlanmagan!</b>\n\n"
+            "Fayllarga logotip qo'yish uchun quyidagi menyudan <b>«📁 File logo qo'yish»</b> tugmasini bosing yoki avval doimiy logotip yuklang.",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb()
+        )
+
 
 @router.message()
 async def handle_direct_photo_upload(message: Message, state: FSMContext, bot: Bot):
