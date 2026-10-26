@@ -345,24 +345,31 @@ def process_pdf_file(input_path: str, output_path: str, cover_path: Optional[str
             return output_path
 
         total_pages = len(doc)
-        pw, ph = 595.0, 842.0
-        if total_pages > 0:
-            pw, ph = doc[0].rect.width, doc[0].rect.height
+        if total_pages == 0:
+            doc.close()
+            shutil.copyfile(input_path, output_path)
+            return output_path
 
-        if total_pages >= 2:
-            doc.delete_page(total_pages - 1)
-            doc.delete_page(0)
-            front_page = doc.new_page(0, width=pw, height=ph)
-            front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
-            back_page = doc.new_page(len(doc), width=pw, height=ph)
-            back_page.insert_image(back_page.rect, filename=cover_path, keep_proportion=True)
-        elif total_pages == 1:
-            doc.delete_page(0)
-            front_page = doc.new_page(0, width=pw, height=ph)
-            front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+        first_page_rect = doc[0].rect
+        pw = first_page_rect.width if first_page_rect.width > 0 else 595.0
+
+        try:
+            with Image.open(cover_path) as cimg:
+                cw, ch = cimg.size
+        except Exception:
+            cw, ch = 800, 800
+
+        # Logotip rasmining asl nisbatiga (aspect ratio) mos balandlikni hisoblash
+        # (Manhvaning 23,000px ga cho'zilib, fayl buzilishining oldini oladi)
+        if cw > 0:
+            cover_page_h = pw * (ch / cw)
         else:
-            front_page = doc.new_page(0, width=pw, height=ph)
-            front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
+            cover_page_h = pw * 1.414
+
+        # Asl sahifalarni HECH QACHON O'CHIRMAYDI!
+        # Logotip/muqovani eng boshiga (0-sahifaga) sifatli va to'liq joylashtiradi
+        front_page = doc.new_page(0, width=pw, height=cover_page_h)
+        front_page.insert_image(front_page.rect, filename=cover_path, keep_proportion=True)
 
         doc.save(output_path, garbage=1, deflate=True)
         doc.close()
@@ -381,20 +388,16 @@ def process_archive_file(input_path: str, output_path: str, cover_path: Optional
         with open(cover_path, "rb") as f:
             cover_bytes = f.read()
 
-        image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+        cover_ext = Path(cover_path).suffix.lower()
+        if not cover_ext:
+            cover_ext = ".jpg"
 
         with zipfile.ZipFile(input_path, "r") as z_in:
-            file_list = [f for f in z_in.namelist() if not f.endswith('/')]
-            image_files = sorted([f for f in file_list if f.lower().endswith(image_exts)])
-
-            first_img = image_files[0] if image_files else None
-            last_img = image_files[-1] if len(image_files) > 1 else None
-
             with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as z_out:
+                # Logotipni arxiv boshiga muqova qilib qo'yish (asl rasmlarni o'chirmasdan)
+                z_out.writestr(f"00000_cover{cover_ext}", cover_bytes)
                 for item in z_in.infolist():
-                    if item.filename == first_img or item.filename == last_img:
-                        z_out.writestr(item.filename, cover_bytes)
-                    else:
+                    if not item.filename.endswith('/'):
                         z_out.writestr(item, z_in.read(item.filename))
     except Exception as err:
         logging.warning(f"Archive processing fallback to original: {err}")
@@ -403,9 +406,35 @@ def process_archive_file(input_path: str, output_path: str, cover_path: Optional
 
 
 def process_image_file(input_path: str, output_path: str, cover_path: Optional[str] = None) -> str:
-    if cover_path and os.path.exists(cover_path):
-        shutil.copyfile(cover_path, output_path)
-    else:
+    if not cover_path or not os.path.exists(cover_path):
+        shutil.copyfile(input_path, output_path)
+        return output_path
+
+    try:
+        with Image.open(input_path) as base_img:
+            base_img = base_img.convert("RGBA")
+            with Image.open(cover_path) as logo_img:
+                logo_img = logo_img.convert("RGBA")
+
+                # Asl rasmning 20% gacha bo'lgan qismiga moslab logotipni kichraytirish
+                bw, bh = base_img.size
+                lw, lh = logo_img.size
+                scale = min((bw * 0.20) / lw, (bh * 0.20) / lh, 1.0)
+                new_size = (max(1, int(lw * scale)), max(1, int(lh * scale)))
+                logo_resized = logo_img.resize(new_size, Image.Resampling.LANCZOS)
+
+                # Pastki o'ng burchakka chiroyli joylashtirish
+                margin = max(5, int(bw * 0.02))
+                pos = (max(0, bw - new_size[0] - margin), max(0, bh - new_size[1] - margin))
+                base_img.paste(logo_resized, pos, logo_resized)
+
+                ext = Path(output_path).suffix.lower()
+                if ext in ('.jpg', '.jpeg'):
+                    base_img.convert("RGB").save(output_path, "JPEG", quality=95)
+                else:
+                    base_img.save(output_path)
+    except Exception as err:
+        logging.warning(f"Image processing fallback to original: {err}")
         shutil.copyfile(input_path, output_path)
     return output_path
 
