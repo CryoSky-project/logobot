@@ -1283,70 +1283,6 @@ async def on_shutdown(bot: Bot):
     await bot.session.close()
 
 
-def main():
-    if not BOT_TOKEN:
-        print("BOT_TOKEN topilmadi!")
-        return
-
-    api_url = LOCAL_API_URL
-    # Agar Render-da ishlayotgan bo'lsa
-    if os.getenv("RENDER"):
-        if "localhost" in api_url or "127.0.0.1" in api_url:
-            api_url = api_url.replace("localhost", "157.173.110.5").replace("127.0.0.1", "157.173.110.5")
-        if not api_url:
-            api_url = "http://157.173.110.5:8081"
-
-    async def run_polling():
-        nonlocal api_url
-        _bot = None
-        if api_url:
-            is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
-            _session = AiohttpSession(
-                api=TelegramAPIServer.from_base(api_url, is_local=is_local),
-                timeout=3600
-            )
-            _bot = Bot(token=BOT_TOKEN, session=_session)
-            print(f"Local Bot API ishlatilmoqda: {api_url} (is_local={is_local})")
-        else:
-            _session = AiohttpSession(timeout=3600)
-            _bot = Bot(token=BOT_TOKEN, session=_session)
-            print("Oddiy Telegram Bot API ishlatilmoqda (Max 50MB).")
-
-        _dp = Dispatcher(storage=MemoryStorage())
-        _dp.include_router(router)
-
-        try:
-            await on_startup(_bot, _dp)
-            await _dp.start_polling(_bot)
-        except Exception as e:
-            if api_url:
-                print(f"Local Bot API ulanishda xatolik: {e}. Standart Telegram API-ga o'tilmoqda...")
-                try:
-                    await _bot.session.close()
-                except Exception:
-                    pass
-                _session2 = AiohttpSession(timeout=3600)
-                _bot = Bot(token=BOT_TOKEN, session=_session2)
-                _dp2 = Dispatcher(storage=MemoryStorage())
-                _dp2.include_router(router)
-                await on_startup(_bot, _dp2)
-                await _dp2.start_polling(_bot)
-            else:
-                raise e
-        finally:
-            if _bot:
-                await on_shutdown(_bot)
-
-    asyncio.run(run_polling())
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (KeyboardInterrupt, SystemExit):
-        pass
-
-
 # =====================================================================
 # KERAKSIZ SAHIFANI O'CHIRISH (MANGA CLEANER)
 # =====================================================================
@@ -1416,3 +1352,74 @@ async def handle_incoming_remove_files(message: Message, state: FSMContext, bot:
 
     if batch["timer_task"] is None or batch["timer_task"].done():
         batch["timer_task"] = asyncio.create_task(handle_user_batch_timer(chat_id, bot))
+
+
+# =====================================================================
+# ASOSIY ISHGA TUSHIRISH (MAIN)
+# =====================================================================
+def main():
+    if not BOT_TOKEN:
+        print("BOT_TOKEN topilmadi!")
+        return
+
+    api_url = LOCAL_API_URL
+    if os.getenv("RENDER"):
+        if "localhost" in api_url or "127.0.0.1" in api_url:
+            api_url = api_url.replace("localhost", "157.173.110.5").replace("127.0.0.1", "157.173.110.5")
+        if not api_url:
+            api_url = "http://157.173.110.5:8081"
+
+    async def run_polling():
+        nonlocal api_url
+
+        # Render port check har doim birinchi soniyadanoq muvaffaqiyatli bo'lishi uchun:
+        await run_health_server()
+
+        _bot = None
+        use_local = False
+        if api_url:
+            try:
+                is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
+                test_session = AiohttpSession(
+                    api=TelegramAPIServer.from_base(api_url, is_local=is_local),
+                    timeout=5
+                )
+                test_bot = Bot(token=BOT_TOKEN, session=test_session)
+                await asyncio.wait_for(test_bot.get_me(), timeout=4.0)
+                await test_session.close()
+                use_local = True
+                print(f"Local Bot API muvaffaqiyatli ulandi: {api_url}")
+            except Exception as e:
+                print(f"Local Bot API ulanishda xatolik ({e}). Standart Telegram API-ga o'tilmoqda...")
+                use_local = False
+
+        if use_local:
+            is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
+            _session = AiohttpSession(
+                api=TelegramAPIServer.from_base(api_url, is_local=is_local),
+                timeout=3600
+            )
+            _bot = Bot(token=BOT_TOKEN, session=_session)
+        else:
+            _session = AiohttpSession(timeout=3600)
+            _bot = Bot(token=BOT_TOKEN, session=_session)
+            print("Standart Telegram API ishlatilmoqda.")
+
+        _dp = Dispatcher(storage=MemoryStorage())
+        _dp.include_router(router)
+
+        try:
+            await on_startup(_bot, _dp)
+            await _dp.start_polling(_bot)
+        finally:
+            if _bot:
+                await on_shutdown(_bot)
+
+    asyncio.run(run_polling())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        pass
