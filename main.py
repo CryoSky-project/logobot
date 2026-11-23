@@ -264,6 +264,8 @@ class BotStates(StatesGroup):
     waiting_for_permanent_logo = State()
     waiting_for_files = State()
     waiting_for_admin_id = State()
+    waiting_for_remove_target_image = State()
+    waiting_for_remove_files = State()
 
 
 # --- KEYBOARDS ---
@@ -271,6 +273,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📁 File logo qo'yish")],
+            [KeyboardButton(text="🗑️ Keraksiz sahifani o'chirish")],
             [KeyboardButton(text="🖼️ Doimiy logotip"), KeyboardButton(text="👥 Adminlar")]
         ],
         resize_keyboard=True
@@ -318,6 +321,120 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
 
 # =====================================================================
 # FAYLLARNI QAYTA ISHLASH FUNKSIYALARI (PDF, ZIP, CBZ, RASMLAR)
+
+# =====================================================================
+# RASM TAQQOSLASH VA MANGA SAHIFALARINI O'CHIRISH (dHash)
+# =====================================================================
+def get_dhash(img: Image.Image, hash_size: int = 8) -> str:
+    """Rasmdan 64-bitli dHash (Difference Hash) generatsiya qiladi."""
+    try:
+        img_l = img.convert('L').resize((hash_size + 1, hash_size), Image.Resampling.BILINEAR)
+        pixels = list(img_l.getdata())
+        diff = []
+        for row in range(hash_size):
+            for col in range(hash_size):
+                pixel_left = pixels[row * (hash_size + 1) + col]
+                pixel_right = pixels[row * (hash_size + 1) + col + 1]
+                diff.append(pixel_left > pixel_right)
+        decimal_value = 0
+        hex_string = []
+        for index, value in enumerate(diff):
+            if value:
+                decimal_value += 2**(index % 8)
+            if (index % 8) == 7:
+                hex_string.append(hex(decimal_value)[2:].rjust(2, '0'))
+                decimal_value = 0
+        return ''.join(hex_string)
+    except Exception:
+        return ""
+
+def hamming_dist(s1: str, s2: str) -> int:
+    try:
+        return bin(int(s1, 16) ^ int(s2, 16)).count('1')
+    except Exception:
+        return 999
+
+def remove_pages_from_pdf(input_path: str, output_path: str, target_img_path: str, threshold: int = 7) -> int:
+    """PDF ichidan ko'rsatilgan rasmga 95%+ o'xshash sahifalarni topib o'chiradi."""
+    try:
+        target_img = Image.open(target_img_path)
+        target_hash = get_dhash(target_img)
+        if not target_hash:
+            shutil.copyfile(input_path, output_path)
+            return 0
+        target_ratio = target_img.width / max(1, target_img.height)
+
+        doc = fitz.open(input_path)
+        total_p = len(doc)
+        if total_p == 0:
+            doc.close()
+            shutil.copyfile(input_path, output_path)
+            return 0
+
+        removed_indices = []
+        for page_num in range(total_p):
+            page = doc[page_num]
+            pix = page.get_pixmap(dpi=72)
+            pimg = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+            pratio = pimg.width / max(1, pimg.height)
+            if abs(pratio - target_ratio) < 0.25:
+                phash = get_dhash(pimg)
+                if phash and hamming_dist(phash, target_hash) <= threshold:
+                    removed_indices.append(page_num)
+
+        if removed_indices:
+            if len(removed_indices) < total_p:
+                doc.delete_pages(removed_indices)
+            doc.save(output_path, garbage=1, deflate=True)
+            doc.close()
+            return len(removed_indices)
+        else:
+            doc.close()
+            shutil.copyfile(input_path, output_path)
+            return 0
+    except Exception as err:
+        logging.warning(f"remove_pages_from_pdf xatolik: {err}")
+        shutil.copyfile(input_path, output_path)
+        return 0
+
+def remove_pages_from_archive(input_path: str, output_path: str, target_img_path: str, threshold: int = 7) -> int:
+    """ZIP/CBZ arxiv ichidagi har bir rasmni tekshirib, ko'rsatilgan rasmga o'xshashlarini o'chiradi."""
+    try:
+        target_img = Image.open(target_img_path)
+        target_hash = get_dhash(target_img)
+        if not target_hash:
+            shutil.copyfile(input_path, output_path)
+            return 0
+        target_ratio = target_img.width / max(1, target_img.height)
+
+        removed_count = 0
+        with zipfile.ZipFile(input_path, 'r') as z_in:
+            with zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_STORED) as z_out:
+                for item in z_in.infolist():
+                    if item.filename.endswith('/'):
+                        z_out.writestr(item, z_in.read(item.filename))
+                        continue
+                    ext = Path(item.filename).suffix.lower()
+                    data = z_in.read(item.filename)
+                    if ext in ('.jpg', '.jpeg', '.png', '.webp', '.bmp'):
+                        try:
+                            import io
+                            with Image.open(io.BytesIO(data)) as simg:
+                                sratio = simg.width / max(1, simg.height)
+                                if abs(sratio - target_ratio) < 0.25:
+                                    shash = get_dhash(simg)
+                                    if shash and hamming_dist(shash, target_hash) <= threshold:
+                                        removed_count += 1
+                                        continue
+                        except Exception:
+                            pass
+                    z_out.writestr(item, data)
+        return removed_count
+    except Exception as err:
+        logging.warning(f"remove_pages_from_archive xatolik: {err}")
+        shutil.copyfile(input_path, output_path)
+        return 0
+
 # =====================================================================
 
 def make_telegram_thumbnail(image_path: str, thumb_path: str) -> str:
@@ -568,6 +685,7 @@ async def handle_user_batch_timer(chat_id: int, bot: Bot):
         "type": "album",
         "chat_id": chat_id,
         "active_logo": active_logo,
+        "task_mode": batch.get("task_mode", "logo"),
         "files": files_data,
         "status_msg": status_msg
     })
@@ -629,14 +747,26 @@ async def queue_worker_loop(bot: Bot):
                             make_telegram_thumbnail(active_logo, thumb_path)
                             has_thumb = True
 
-                        if file_ext == ".pdf":
-                            process_pdf_file(input_path, output_path, active_logo)
-                        elif file_ext in (".zip", ".cbz"):
-                            process_archive_file(input_path, output_path, active_logo)
-                        elif file_ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
-                            process_image_file(input_path, output_path, active_logo)
+                        task_mode = task.get("task_mode", "logo")
+                        removed_info = ""
+                        if task_mode == "remove":
+                            if file_ext == ".pdf":
+                                del_count = remove_pages_from_pdf(input_path, output_path, active_logo)
+                                removed_info = f"\n🗑️ O'chirilgan sahifalar: <b>{del_count} ta</b>"
+                            elif file_ext in (".zip", ".cbz"):
+                                del_count = remove_pages_from_archive(input_path, output_path, active_logo)
+                                removed_info = f"\n🗑️ O'chirilgan sahifalar: <b>{del_count} ta</b>"
+                            else:
+                                shutil.copyfile(input_path, output_path)
                         else:
-                            shutil.copyfile(input_path, output_path)
+                            if file_ext == ".pdf":
+                                process_pdf_file(input_path, output_path, active_logo)
+                            elif file_ext in (".zip", ".cbz"):
+                                process_archive_file(input_path, output_path, active_logo)
+                            elif file_ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                                process_image_file(input_path, output_path, active_logo)
+                            else:
+                                shutil.copyfile(input_path, output_path)
 
                         log_processed_file(chat_id, filename, file_ext)
 
@@ -644,9 +774,9 @@ async def queue_worker_loop(bot: Bot):
                         fs_input = FSInputFile(output_path, filename=filename)
                         thumb_input = FSInputFile(thumb_path) if has_thumb and os.path.exists(thumb_path) else None
                         caption_text = (
-                            f"✅ <b>Tayyor ({idx}/{total_files}):</b> <code>{safe_fn}</code>"
+                            f"✅ <b>Tayyor ({idx}/{total_files}):</b> <code>{safe_fn}</code>{removed_info}"
                             if total_files > 1
-                            else f"✅ <b>Tayyor:</b> <code>{safe_fn}</code>"
+                            else f"✅ <b>Tayyor:</b> <code>{safe_fn}</code>{removed_info}"
                         )
 
                         if f_type == "photo":
@@ -1194,3 +1324,74 @@ if __name__ == "__main__":
         main()
     except (KeyboardInterrupt, SystemExit):
         pass
+
+
+# =====================================================================
+# KERAKSIZ SAHIFANI O'CHIRISH (MANGA CLEANER)
+# =====================================================================
+@router.message(F.text == "🗑️ Keraksiz sahifani o'chirish")
+async def cmd_remove_page_start(message: Message, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_remove_target_image)
+    text = (
+        "🗑️ <b>Keraksiz sahifani o'chirish bo'limi</b>\n\n"
+        "📸 <b>Manga ichidan o'chirib tashlamoqchi bo'lgan sahifa yoki reklama rasmini (PNG / JPG) yuboring:</b>\n\n"
+        "<i>Bot ushbu rasmga 100% yoki juda o'xshash barcha sahifalarni manga fayllari ichidan avtomatik qidirib topadi va butunlay o'chirib tashlaydi!</i>"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=cancel_to_main_kb())
+
+@router.message(BotStates.waiting_for_remove_target_image)
+async def handle_remove_target_image_received(message: Message, state: FSMContext, bot: Bot):
+    if not is_image_message(message):
+        await message.answer("⚠️ Iltimos, o'chirilishi kerak bo'lgan sahifaning rasmini (PNG / JPG) yuboring!")
+        return
+    try:
+        user_id = message.from_user.id
+        timestamp = int(time.time() * 1000)
+        target_path = SAVED_LOGOS_DIR / f"remove_target_{user_id}_{timestamp}.png"
+        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+        tg_file = await bot.get_file(file_id)
+        await bot.download_file(tg_file.file_path, target_path, timeout=120)
+
+        await state.update_data(remove_target=str(target_path))
+        await state.set_state(BotStates.waiting_for_remove_files)
+
+        text = (
+            "✅ <b>O'chirilishi kerak bo'lgan namuna rasm qabul qilindi!</b>\n\n"
+            "📤 <b>Endi tozalanishi kerak bo'lgan Manga fayllarini (PDF, ZIP yoki CBZ) yuboring:</b>\n"
+            "<i>(Bir nechta fayllarni birdaniga yuborishingiz mumkin. Bot ularning ichidagi barcha mos keluvchi sahifalarni bittadan o'chirib, toza holda qaytaradi.)</i>\n\n"
+            "Tugatish uchun pastdagi <b>«🔙 Bekor qilish»</b> tugmasini bosing."
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=files_receiving_kb())
+    except Exception as e:
+        await message.answer(f"❌ Rasm yuklab olishda xatolik: {e}")
+
+@router.message(BotStates.waiting_for_remove_files, F.document | F.photo)
+async def handle_incoming_remove_files(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    target_img = data.get("remove_target")
+    if not target_img or not os.path.exists(target_img):
+        await message.answer("⚠️ O'chiriladigan rasm namunasi topilmadi! Iltimos, boshidan boshlang.")
+        return
+
+    chat_id = message.chat.id
+    now = time.time()
+
+    if chat_id not in USER_BATCHES:
+        USER_BATCHES[chat_id] = {
+            "messages": [],
+            "active_logo": target_img,
+            "task_mode": "remove",
+            "status_msg": None,
+            "last_received": now,
+            "timer_task": None
+        }
+
+    batch = USER_BATCHES[chat_id]
+    if not any(m.message_id == message.message_id for m in batch["messages"]):
+        batch["messages"].append(message)
+    batch["last_received"] = now
+    batch["active_logo"] = target_img
+    batch["task_mode"] = "remove"
+
+    if batch["timer_task"] is None or batch["timer_task"].done():
+        batch["timer_task"] = asyncio.create_task(collect_and_enqueue_batch(bot, chat_id))
