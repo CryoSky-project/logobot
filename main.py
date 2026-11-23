@@ -397,9 +397,15 @@ def remove_pages_from_pdf(input_path: str, output_path: str, target_img_path: st
                 removed_indices.append(page_num)
 
         if removed_indices:
+            # Барлық беттер mos келсе де, кем дегенде 1 бет қалу керек
             if len(removed_indices) < total_p:
                 doc.delete_pages(removed_indices)
-            doc.save(output_path, garbage=1, deflate=True)
+                doc.save(output_path, garbage=1, deflate=True)
+            else:
+                # Барлық беттер o'chirilsa - bo'sh PDF o'rniga aslini ko'chirib o'tkazamiz
+                doc.close()
+                shutil.copyfile(input_path, output_path)
+                return 0
             doc.close()
             return len(removed_indices)
         else:
@@ -1290,43 +1296,46 @@ def main():
         if not api_url:
             api_url = "http://157.173.110.5:8081"
 
-    bot = None
-    if api_url:
-        is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
-        session = AiohttpSession(
-            api=TelegramAPIServer.from_base(api_url, is_local=is_local),
-            timeout=3600
-        )
-        bot = Bot(token=BOT_TOKEN, session=session)
-        print(f"Local Bot API ishlatilmoqda: {api_url} (is_local={is_local})")
-    else:
-        session = AiohttpSession(timeout=3600)
-        bot = Bot(token=BOT_TOKEN, session=session)
-        print("Oddiy Telegram Bot API ishlatilmoqda (Max 50MB).")
-
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
     async def run_polling():
-        nonlocal bot
+        nonlocal api_url
+        _bot = None
+        if api_url:
+            is_local = os.getenv("IS_LOCAL", "").lower() in ("true", "1", "yes")
+            _session = AiohttpSession(
+                api=TelegramAPIServer.from_base(api_url, is_local=is_local),
+                timeout=3600
+            )
+            _bot = Bot(token=BOT_TOKEN, session=_session)
+            print(f"Local Bot API ishlatilmoqda: {api_url} (is_local={is_local})")
+        else:
+            _session = AiohttpSession(timeout=3600)
+            _bot = Bot(token=BOT_TOKEN, session=_session)
+            print("Oddiy Telegram Bot API ishlatilmoqda (Max 50MB).")
+
+        _dp = Dispatcher(storage=MemoryStorage())
+        _dp.include_router(router)
+
         try:
-            await on_startup(bot, dp)
-            await dp.start_polling(bot)
+            await on_startup(_bot, _dp)
+            await _dp.start_polling(_bot)
         except Exception as e:
             if api_url:
                 print(f"Local Bot API ulanishda xatolik: {e}. Standart Telegram API-ga o'tilmoqda...")
                 try:
-                    await bot.session.close()
+                    await _bot.session.close()
                 except Exception:
                     pass
-                session = AiohttpSession(timeout=3600)
-                bot = Bot(token=BOT_TOKEN, session=session)
-                await on_startup(bot, dp)
-                await dp.start_polling(bot)
+                _session2 = AiohttpSession(timeout=3600)
+                _bot = Bot(token=BOT_TOKEN, session=_session2)
+                _dp2 = Dispatcher(storage=MemoryStorage())
+                _dp2.include_router(router)
+                await on_startup(_bot, _dp2)
+                await _dp2.start_polling(_bot)
             else:
                 raise e
         finally:
-            await on_shutdown(bot)
+            if _bot:
+                await on_shutdown(_bot)
 
     asyncio.run(run_polling())
 
