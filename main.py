@@ -354,15 +354,31 @@ def hamming_dist(s1: str, s2: str) -> int:
     except Exception:
         return 999
 
-def remove_pages_from_pdf(input_path: str, output_path: str, target_img_path: str, threshold: int = 7) -> int:
-    """PDF ichidan ko'rsatilgan rasmga 95%+ o'xshash sahifalarni topib o'chiradi."""
+def images_match(img1: Image.Image, target_hash: str, target_ratio: float, threshold: int = 14) -> bool:
+    """Ikkita rasm bir xil yoki juda o'xshashligini tekshiradi (dHash + aspekt nisbati)."""
     try:
-        target_img = Image.open(target_img_path)
-        target_hash = get_dhash(target_img)
+        r1 = img1.width / max(1, img1.height)
+        # Aspekt nisbati o'xshash bo'lmasa darhol rad etamiz
+        if abs(r1 - target_ratio) > 0.40:
+            return False
+        h1 = get_dhash(img1)
+        if not h1 or not target_hash:
+            return False
+        dist = hamming_dist(h1, target_hash)
+        return dist <= threshold
+    except Exception:
+        return False
+
+def remove_pages_from_pdf(input_path: str, output_path: str, target_img_path: str, threshold: int = 14) -> int:
+    """PDF ichidan ko'rsatilgan rasmga (reklama/muqova) mos sahifalarni topib o'chiradi."""
+    try:
+        with Image.open(target_img_path) as timg:
+            target_hash = get_dhash(timg)
+            target_ratio = timg.width / max(1, timg.height)
+
         if not target_hash:
             shutil.copyfile(input_path, output_path)
             return 0
-        target_ratio = target_img.width / max(1, target_img.height)
 
         doc = fitz.open(input_path)
         total_p = len(doc)
@@ -374,13 +390,11 @@ def remove_pages_from_pdf(input_path: str, output_path: str, target_img_path: st
         removed_indices = []
         for page_num in range(total_p):
             page = doc[page_num]
+            # Sahifani kichikroq o'lchamda render qilish (tezkor tekshiruv)
             pix = page.get_pixmap(dpi=72)
             pimg = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
-            pratio = pimg.width / max(1, pimg.height)
-            if abs(pratio - target_ratio) < 0.25:
-                phash = get_dhash(pimg)
-                if phash and hamming_dist(phash, target_hash) <= threshold:
-                    removed_indices.append(page_num)
+            if images_match(pimg, target_hash, target_ratio, threshold):
+                removed_indices.append(page_num)
 
         if removed_indices:
             if len(removed_indices) < total_p:
@@ -397,15 +411,16 @@ def remove_pages_from_pdf(input_path: str, output_path: str, target_img_path: st
         shutil.copyfile(input_path, output_path)
         return 0
 
-def remove_pages_from_archive(input_path: str, output_path: str, target_img_path: str, threshold: int = 7) -> int:
-    """ZIP/CBZ arxiv ichidagi har bir rasmni tekshirib, ko'rsatilgan rasmga o'xshashlarini o'chiradi."""
+def remove_pages_from_archive(input_path: str, output_path: str, target_img_path: str, threshold: int = 14) -> int:
+    """ZIP/CBZ arxiv ichidagi barcha sahifalarni tekshirib, o'xshashlarini o'chiradi."""
     try:
-        target_img = Image.open(target_img_path)
-        target_hash = get_dhash(target_img)
+        with Image.open(target_img_path) as timg:
+            target_hash = get_dhash(timg)
+            target_ratio = timg.width / max(1, timg.height)
+
         if not target_hash:
             shutil.copyfile(input_path, output_path)
             return 0
-        target_ratio = target_img.width / max(1, target_img.height)
 
         removed_count = 0
         with zipfile.ZipFile(input_path, 'r') as z_in:
@@ -420,12 +435,9 @@ def remove_pages_from_archive(input_path: str, output_path: str, target_img_path
                         try:
                             import io
                             with Image.open(io.BytesIO(data)) as simg:
-                                sratio = simg.width / max(1, simg.height)
-                                if abs(sratio - target_ratio) < 0.25:
-                                    shash = get_dhash(simg)
-                                    if shash and hamming_dist(shash, target_hash) <= threshold:
-                                        removed_count += 1
-                                        continue
+                                if images_match(simg, target_hash, target_ratio, threshold):
+                                    removed_count += 1
+                                    continue
                         except Exception:
                             pass
                     z_out.writestr(item, data)
@@ -1185,7 +1197,7 @@ async def handle_incoming_files_in_queue(message: Message, state: FSMContext, bo
 @router.message(F.document)
 async def handle_direct_document_upload(message: Message, state: FSMContext, bot: Bot):
     current_state = await state.get_state()
-    if current_state in (BotStates.waiting_for_new_logo, BotStates.waiting_for_permanent_logo, BotStates.waiting_for_admin_id):
+    if current_state in (BotStates.waiting_for_new_logo, BotStates.waiting_for_permanent_logo, BotStates.waiting_for_admin_id, BotStates.waiting_for_remove_target_image, BotStates.waiting_for_remove_files):
         return
 
     user_id = message.from_user.id
@@ -1206,7 +1218,7 @@ async def handle_direct_document_upload(message: Message, state: FSMContext, bot
 @router.message()
 async def handle_direct_photo_upload(message: Message, state: FSMContext, bot: Bot):
     current_state = await state.get_state()
-    if current_state in (BotStates.waiting_for_files, BotStates.waiting_for_new_logo, BotStates.waiting_for_permanent_logo, BotStates.waiting_for_admin_id):
+    if current_state in (BotStates.waiting_for_files, BotStates.waiting_for_new_logo, BotStates.waiting_for_permanent_logo, BotStates.waiting_for_admin_id, BotStates.waiting_for_remove_target_image, BotStates.waiting_for_remove_files):
         return
     if is_image_message(message):
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
@@ -1394,4 +1406,4 @@ async def handle_incoming_remove_files(message: Message, state: FSMContext, bot:
     batch["task_mode"] = "remove"
 
     if batch["timer_task"] is None or batch["timer_task"].done():
-        batch["timer_task"] = asyncio.create_task(collect_and_enqueue_batch(bot, chat_id))
+        batch["timer_task"] = asyncio.create_task(handle_user_batch_timer(chat_id, bot))
