@@ -59,7 +59,7 @@ if not env_path.exists():
 if env_path.exists():
     load_dotenv(env_path)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "8684264908:AAE9FzHZH6LKG6hri8XJdsOvXMwqYlK0I_o"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8964013713:AAG8V-PHzHwl4T1n4-1W0VCkJtBnFVsqrbw"
 PORT = int(os.getenv("PORT", "8000"))
 LOCAL_API_URL = os.getenv("LOCAL_API_URL", "")  # e.g. "http://localhost:8081"
 DB_PATH = BASE_DIR / "logobot.db"
