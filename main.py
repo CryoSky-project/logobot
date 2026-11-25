@@ -61,7 +61,10 @@ if env_path.exists():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "8964013713:AAG8V-PHzHwl4T1n4-1W0VCkJtBnFVsqrbw"
 PORT = int(os.getenv("PORT", "8000"))
-LOCAL_API_URL = os.getenv("LOCAL_API_URL", "")  # e.g. "http://localhost:8081"
+LOCAL_API_URL = os.getenv("LOCAL_API_URL") or "http://157.173.110.5:8081"
+if os.getenv("RENDER"):
+    if "localhost" in LOCAL_API_URL or "127.0.0.1" in LOCAL_API_URL or not LOCAL_API_URL:
+        LOCAL_API_URL = "http://157.173.110.5:8081"
 DB_PATH = BASE_DIR / "logobot.db"
 
 SAVED_LOGOS_DIR = BASE_DIR / "saved_logos"
